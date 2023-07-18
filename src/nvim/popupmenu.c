@@ -14,6 +14,7 @@
 #include "nvim/api/private/helpers.h"
 #include "nvim/ascii.h"
 #include "nvim/buffer.h"
+#include "nvim/buffer_defs.h"
 #include "nvim/charset.h"
 #include "nvim/drawscreen.h"
 #include "nvim/eval/typval.h"
@@ -667,6 +668,28 @@ void pum_redraw(void)
   }
 }
 
+/// Set up for a pmenu preview window
+///
+/// @param undo_sync  sync undo when leaving the window
+///
+/// @return           true when it was created.
+static bool pum_preview_win(Buffer buffer)
+{
+  win_T *wp;
+  if (!curwin->w_preview_wid) {
+    FloatConfig fconfig = FLOAT_CONFIG_INIT;
+    Error *err;
+    wp = win_new_float(NULL, false, fconfig, err);
+    // autocmds in win_enter or win_set_buf below may close the window
+    if (win_valid(wp) && buffer > 0) {
+      win_set_buf(wp->handle, buffer, fconfig.noautocmd, err);
+    }
+  }
+
+
+  return curwin->w_preview_wid;
+}
+
 /// Set the index of the currently selected item.  The menu will scroll when
 /// necessary.  When "n" is out of range don't scroll.
 /// This may be repeated when the preview window is used:
@@ -787,6 +810,7 @@ static bool pum_set_selected(int n, int repeat)
             set_option_value_give_err("diff", BOOLEAN_OPTVAL(false), OPT_LOCAL);
           }
         }
+        int pum_p_wid = pum_preview_win(curbuf->handle);
 
         if (res == OK) {
           char *p, *e;

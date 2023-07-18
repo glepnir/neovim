@@ -1398,6 +1398,8 @@ struct window_S {
   StlClickDefinition *w_statuscol_click_defs;
   // Size of the w_statuscol_click_defs array
   size_t w_statuscol_click_defs_size;
+  // pmenu preview window id
+  int w_preview_wid;
 };
 
 /// Macros defined in Vim, but not in Neovim
