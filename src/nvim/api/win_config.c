@@ -67,6 +67,8 @@
 ///       {relative='win', width=12, height=3, bufpos={100,10}})
 /// </pre>
 ///
+/// If want create a float window on neovim startup, It's better run in VimEnter event.
+///
 /// @param buffer Buffer to display, or 0 for current buffer
 /// @param enter  Enter the window (make it the current window)
 /// @param config Map defining the window configuration. Keys:
