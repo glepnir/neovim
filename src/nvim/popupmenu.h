@@ -2,18 +2,24 @@
 
 #include <stdbool.h>
 
+#include "nvim/extmark_defs.h"
 #include "nvim/grid_defs.h"
 #include "nvim/macros.h"
 #include "nvim/types.h"
 #include "nvim/vim.h"
 
 /// Used for popup menu items.
-typedef struct {
-  char *pum_text;          // main menu text
-  char *pum_kind;          // extra kind text (may be truncated)
-  char *pum_extra;         // extra menu text (may be truncated)
-  char *pum_info;          // extra info
-} pumitem_T;
+typedef enum {
+  PumText = 0,
+  PumKind,
+  PumExtra,
+  PumInfo,
+} PUMTEXTKIND;
+
+typedef VirtTextChunk PumItemChunk;
+typedef kvec_t(PumItemChunk) PumItem;
+
+#define hlattr(id) (win_hl_attr(curwin, id))
 
 EXTERN ScreenGrid pum_grid INIT( = SCREEN_GRID_INIT);
 

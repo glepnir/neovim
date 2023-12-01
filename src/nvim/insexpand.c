@@ -23,11 +23,13 @@
 #include "nvim/eval/userfunc.h"
 #include "nvim/ex_eval.h"
 #include "nvim/ex_getln.h"
+#include "nvim/extmark_defs.h"
 #include "nvim/fileio.h"
 #include "nvim/garray.h"
 #include "nvim/getchar.h"
 #include "nvim/gettext.h"
 #include "nvim/globals.h"
+#include "nvim/highlight.h"
 #include "nvim/highlight_defs.h"
 #include "nvim/indent.h"
 #include "nvim/indent_c.h"
@@ -1036,7 +1038,7 @@ void completeopt_was_set(void)
 
 /// "compl_match_array" points the currently displayed list of entries in the
 /// popup menu.  It is NULL when there is no popup menu.
-static pumitem_T *compl_match_array = NULL;
+static PumItem **compl_match_array = NULL;
 static int compl_match_arraysize;
 
 /// Remove any popup menu.
@@ -1047,6 +1049,9 @@ static void ins_compl_del_pum(void)
   }
 
   pum_undisplay(false);
+  for(int i=0; i < compl_match_arraysize; i++){
+    kv_destroy(*compl_match_array[i]);
+  }
   XFREE_CLEAR(compl_match_array);
 }
 
@@ -1160,7 +1165,7 @@ static int ins_compl_build_pum(void)
   }
 
   assert(compl_match_arraysize >= 0);
-  compl_match_array = xcalloc((size_t)compl_match_arraysize, sizeof(pumitem_T));
+  compl_match_array = xcalloc((size_t)compl_match_arraysize, sizeof(VirtText));
 
   // If the current match is the original text don't find the first
   // match after it, don't highlight anything.
@@ -1190,18 +1195,26 @@ static int ins_compl_build_pum(void)
         cur = i;
       }
 
-      if (comp->cp_text[CPT_ABBR] != NULL) {
-        compl_match_array[i].pum_text = comp->cp_text[CPT_ABBR];
-      } else {
-        compl_match_array[i].pum_text = comp->cp_str;
+      PumItem *vt = NULL;
+
+      // WORD
+      kv_push(*vt, ((PumItemChunk){ .text = xstrdup(comp->cp_str),
+                                       .hl_id = hlattr(HLF_PNI) }));
+      if (comp->cp_text[CPT_KIND]) {
+        kv_push(*vt, ((PumItemChunk){ .text = xstrdup(comp->cp_text[CPT_KIND]),
+                                         .hl_id = hlattr(HLF_PNK) }));
       }
-      compl_match_array[i].pum_kind = comp->cp_text[CPT_KIND];
-      compl_match_array[i].pum_info = comp->cp_text[CPT_INFO];
-      if (comp->cp_text[CPT_MENU] != NULL) {
-        compl_match_array[i++].pum_extra = comp->cp_text[CPT_MENU];
-      } else {
-        compl_match_array[i++].pum_extra = comp->cp_fname;
+
+      // INFO
+      if (comp->cp_text[CPT_INFO]) {
+        kv_push(*vt, ((PumItemChunk){ .text = xstrdup(comp->cp_text[CPT_INFO]),
+                                         .hl_id = -1 }));
       }
+
+      // MENU
+      kv_push(*vt, ((PumItemChunk){ .text = xstrdup(comp->cp_text[CPT_MENU] != NULL ? comp->cp_text[CPT_MENU] : comp->cp_fname),
+                                       .hl_id = hlattr(HLF_PNX) }));
+      compl_match_array[i++] = vt;
     }
 
     if (comp == compl_shown_match) {
@@ -1251,8 +1264,8 @@ void ins_compl_show_pum(void)
   } else {
     // popup menu already exists, only need to find the current item.
     for (int i = 0; i < compl_match_arraysize; i++) {
-      if (compl_match_array[i].pum_text == compl_shown_match->cp_str
-          || compl_match_array[i].pum_text == compl_shown_match->cp_text[CPT_ABBR]) {
+      if (compl_match_array[i]->items->text == compl_shown_match->cp_str
+          || compl_match_array[i]->items->text == compl_shown_match->cp_text[CPT_ABBR]) {
         cur = i;
         break;
       }
