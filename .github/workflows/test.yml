@@ -2,11 +2,11 @@ name: test
 on:
   push:
     branches:
-      - 'master'
+      - 'term_eof'
       - 'release-[0-9]+.[0-9]+'
   pull_request:
     branches:
-      - 'master'
+      - 'term_eof'
       - 'release-[0-9]+.[0-9]+'
     paths-ignore:
       - 'contrib/**'

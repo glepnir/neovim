@@ -1649,8 +1649,7 @@ static void fetch_row(Terminal *term, int row, int end_col)
 
   while (col < end_col) {
     VTermScreenCell cell;
-    fetch_cell(term, row, col, &cell);
-    if (cell.chars[0]) {
+    if (fetch_cell(term, row, col, &cell) && cell.chars[0] != NUL) {
       int cell_len = 0;
       for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && cell.chars[i]; i++) {
         cell_len += utf_char2bytes((int)cell.chars[i], ptr + cell_len);
@@ -1681,11 +1680,9 @@ static bool fetch_cell(Terminal *term, int row, int col, VTermScreenCell *cell)
       };
       return false;
     }
-  } else {
-    vterm_screen_get_cell(term->vts, (VTermPos){ .row = row, .col = col },
-                          cell);
   }
-  return true;
+
+  return vterm_screen_get_cell(term->vts, (VTermPos){ .row = row, .col = col }, cell);
 }
 
 // queue a terminal instance for refresh
