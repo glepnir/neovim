@@ -9256,6 +9256,14 @@ describe('float window', function()
       api.nvim_set_current_win(winid)
       eq("floating window cannot be relative to itself", pcall_err(api.nvim_win_set_config, winid, config))
     end)
+
+    it('error when close non current buffer and nvim only have one normal window', function ()
+      local buf = api.nvim_create_buf(true, true)
+      local config = { relative='win', width=5, height=2, row=3, col=3 }
+      local winid = api.nvim_open_win(buf, true, config)
+      api.nvim_set_current_win(winid)
+      eq('Vim(bdelete):E444: Cannot close last window', pcall_err(command, 'bd1'))
+    end)
   end
 
   describe('with ext_multigrid', function()

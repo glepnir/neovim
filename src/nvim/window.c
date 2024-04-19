@@ -2485,7 +2485,7 @@ void close_windows(buf_T *buf, bool keep_curwin)
 
   // Start from lastwin to close floating windows with the same buffer first.
   // When the autocommand window is involved win_close() may need to print an error message.
-  for (win_T *wp = lastwin; wp != NULL && (is_aucmd_win(lastwin) || !one_window(wp));) {
+  for (win_T *wp = lastwin; wp != NULL && (is_aucmd_win(lastwin) || !ONE_WINDOW);) {
     if (wp->w_buffer == buf && (!keep_curwin || wp != curwin)
         && !(wp->w_closing || wp->w_buffer->b_locked > 0)) {
       if (win_close(wp, false, false) == FAIL) {
