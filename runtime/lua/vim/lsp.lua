@@ -542,12 +542,14 @@ local function buf_attach(bufnr)
   })
   -- First time, so attach and set up stuff.
   api.nvim_buf_attach(bufnr, false, {
-    on_lines = function(_, _, changedtick, firstline, lastline, new_lastline)
+    on_lines = function(_, _, changedtick, firstline, lastline, new_lastline, byte_count)
       if #lsp.get_clients({ bufnr = bufnr }) == 0 then
         return true -- detach
       end
       util.buf_versions[bufnr] = changedtick
-      changetracking.send_changes(bufnr, firstline, lastline, new_lastline)
+      if byte_count ~= 0 then
+        changetracking.send_changes(bufnr, firstline, lastline, new_lastline)
+      end
     end,
 
     on_reload = function()
