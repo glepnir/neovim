@@ -14,6 +14,7 @@ typedef struct {
   char *pum_kind;          // extra kind text (may be truncated)
   char *pum_extra;         // extra menu text (may be truncated)
   char *pum_info;          // extra info
+  int   pum_score;         // fuzzy match score of item
 } pumitem_T;
 
 EXTERN ScreenGrid pum_grid INIT( = SCREEN_GRID_INIT);
