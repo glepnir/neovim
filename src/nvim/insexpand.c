@@ -3681,16 +3681,16 @@ static int find_next_completion_match(bool allow_get_expansion, int todo, bool a
 
   while (--todo >= 0) {
     if (compl_shows_dir_forward() && compl_shown_match->cp_next != NULL) {
-      compl_shown_match = !compl_fuzzy_match ? compl_shown_match->cp_next
-                                             : find_comp_when_fuzzy();
+      compl_shown_match = compl_fuzzy_match && compl_match_array != NULL ? find_comp_when_fuzzy()
+                                                              : compl_shown_match->cp_next;
       found_end = (compl_first_match != NULL
                    && (is_first_match(compl_shown_match->cp_next)
                        || is_first_match(compl_shown_match)));
     } else if (compl_shows_dir_backward()
                && compl_shown_match->cp_prev != NULL) {
       found_end = is_first_match(compl_shown_match);
-      compl_shown_match = !compl_fuzzy_match ? compl_shown_match->cp_prev
-                                             : find_comp_when_fuzzy();
+      compl_shown_match = compl_fuzzy_match && compl_match_array != NULL ? find_comp_when_fuzzy()
+                                                              : compl_shown_match->cp_prev;
       found_end |= is_first_match(compl_shown_match);
     } else {
       if (!allow_get_expansion) {
@@ -4006,70 +4006,107 @@ static bool ins_compl_use_match(int c)
 /// Uses the global variables: compl_cont_status and ctrl_x_mode
 static int get_normal_compl_info(char *line, int startcol, colnr_T curs_col)
 {
-  if ((compl_cont_status & CONT_SOL) || ctrl_x_mode_path_defines()) {
-    if (!compl_status_adding()) {
-      while (--startcol >= 0 && vim_isIDc((uint8_t)line[startcol])) {}
-      compl_col += ++startcol;
-      compl_length = curs_col - startcol;
-    }
-    if (p_ic) {
-      compl_pattern = str_foldcase(line + compl_col, compl_length, NULL, 0);
+    bool compl_fuzzy_match = (get_cot_flags() & COT_FUZZY) != 0;
+
+    if ((compl_cont_status & CONT_SOL) || ctrl_x_mode_path_defines()) {
+        if (!compl_status_adding()) {
+            while (--startcol >= 0 && vim_isIDc((uint8_t)line[startcol])) {}
+            compl_col += ++startcol;
+            compl_length = curs_col - startcol;
+        }
+        if (p_ic) {
+            compl_pattern = str_foldcase(line + compl_col, compl_length, NULL, 0);
+        } else {
+            compl_pattern = xstrnsave(line + compl_col, (size_t)compl_length);
+        }
+        if (compl_fuzzy_match) {
+            size_t fuzzy_len = (size_t)compl_length * 4 + 5; // Adjust size to avoid buffer overflow
+            char *fuzzy_pattern = xmalloc(fuzzy_len); // Allocate enough space
+            strcpy(fuzzy_pattern, "\\v"); // Use 'very magic' mode for simpler syntax
+            for (int i = 0; i < compl_length; ++i) {
+                strncat(fuzzy_pattern, "\\k*", 3); // Match any keyword character (zero or more)
+                strncat(fuzzy_pattern, &compl_pattern[i], 1); // Match the current character
+            }
+            xfree(compl_pattern);
+            compl_pattern = fuzzy_pattern;
+        }
+    } else if (compl_status_adding()) {
+        char *prefix = "\\<";
+        size_t prefixlen = STRLEN_LITERAL("\\<");
+
+        size_t needed_size = quote_meta(NULL, line + compl_col, compl_length) + prefixlen + 1;
+        compl_pattern = xmalloc(needed_size);
+        if (!vim_iswordp(line + compl_col)
+            || (compl_col > 0
+                && (vim_iswordp(mb_prevptr(line, line + compl_col))))) {
+            prefix = "";
+            prefixlen = 0;
+        }
+        STRCPY(compl_pattern, prefix);
+        quote_meta(compl_pattern + prefixlen, line + compl_col, compl_length);
+        if (compl_fuzzy_match) {
+            size_t fuzzy_len = ((size_t)compl_length + prefixlen) * 4 + 5; // Adjust size to avoid buffer overflow
+            char *fuzzy_pattern = xmalloc(fuzzy_len); // Allocate enough space
+            strcpy(fuzzy_pattern, "\\v"); // Use 'very magic' mode for simpler syntax
+            for (size_t i = prefixlen; i < (size_t)compl_length + prefixlen; ++i) {
+                strncat(fuzzy_pattern, "\\k*", 3); // Match any keyword character (zero or more)
+                strncat(fuzzy_pattern, &compl_pattern[i], 1); // Match the current character
+            }
+            xfree(compl_pattern);
+            compl_pattern = fuzzy_pattern;
+        }
+    } else if (--startcol < 0
+               || !vim_iswordp(mb_prevptr(line, line + startcol + 1))) {
+        compl_pattern = xstrnsave(S_LEN("\\<\\k\\k"));
+        compl_col += curs_col;
+        compl_length = 0;
+        if (compl_fuzzy_match) {
+            size_t fuzzy_len = strlen(compl_pattern) * 4 + 5; // Adjust size to avoid buffer overflow
+            char *fuzzy_pattern = xmalloc(fuzzy_len); // Allocate enough space
+            strcpy(fuzzy_pattern, "\\v\\k*"); // Use 'very magic' mode for simpler syntax
+            strcat(fuzzy_pattern, compl_pattern + 2); // Append the original pattern without "\\<"
+            xfree(compl_pattern);
+            compl_pattern = fuzzy_pattern;
+        }
     } else {
-      compl_pattern = xstrnsave(line + compl_col, (size_t)compl_length);
+        startcol -= utf_head_off(line, line + startcol);
+        int base_class = mb_get_class(line + startcol);
+        while (--startcol >= 0) {
+            int head_off = utf_head_off(line, line + startcol);
+            if (base_class != mb_get_class(line + startcol - head_off)) {
+                break;
+            }
+            startcol -= head_off;
+        }
+        compl_col += ++startcol;
+        compl_length = (int)curs_col - startcol;
+        if (compl_length == 1) {
+            compl_pattern = xmalloc(7);
+            STRCPY(compl_pattern, "\\<");
+            quote_meta(compl_pattern + 2, line + compl_col, 1);
+            strcat(compl_pattern, "\\k");
+        } else {
+            size_t needed_size = quote_meta(NULL, line + compl_col, compl_length) + 3;
+            compl_pattern = xmalloc(needed_size);
+            STRCPY(compl_pattern, "\\<");
+            quote_meta(compl_pattern + 2, line + compl_col, compl_length);
+        }
+        if (compl_fuzzy_match) {
+            size_t fuzzy_len = (size_t)compl_length * 4 + 5; // Adjust size to avoid buffer overflow
+            char *fuzzy_pattern = xmalloc(fuzzy_len); // Allocate enough space
+            strcpy(fuzzy_pattern, "\\v"); // Use 'very magic' mode for simpler syntax
+            for (int i = 2; i < compl_length + 2; ++i) {
+                strncat(fuzzy_pattern, "\\k*", 3); // Match any keyword character (zero or more)
+                strncat(fuzzy_pattern, &compl_pattern[i], 1); // Match the current character, skipping the "\\<"
+            }
+            xfree(compl_pattern);
+            compl_pattern = fuzzy_pattern;
+        }
     }
-  } else if (compl_status_adding()) {
-    char *prefix = "\\<";
-    size_t prefixlen = STRLEN_LITERAL("\\<");
 
-    // we need up to 2 extra chars for the prefix
-    compl_pattern = xmalloc(quote_meta(NULL, line + compl_col,
-                                       compl_length) + prefixlen);
-    if (!vim_iswordp(line + compl_col)
-        || (compl_col > 0
-            && (vim_iswordp(mb_prevptr(line, line + compl_col))))) {
-      prefix = "";
-      prefixlen = 0;
-    }
-    STRCPY(compl_pattern, prefix);
-    quote_meta(compl_pattern + prefixlen, line + compl_col, compl_length);
-  } else if (--startcol < 0
-             || !vim_iswordp(mb_prevptr(line, line + startcol + 1))) {
-    // Match any word of at least two chars
-    compl_pattern = xstrnsave(S_LEN("\\<\\k\\k"));
-    compl_col += curs_col;
-    compl_length = 0;
-  } else {
-    // Search the point of change class of multibyte character
-    // or not a word single byte character backward.
-    startcol -= utf_head_off(line, line + startcol);
-    int base_class = mb_get_class(line + startcol);
-    while (--startcol >= 0) {
-      int head_off = utf_head_off(line, line + startcol);
-      if (base_class != mb_get_class(line + startcol - head_off)) {
-        break;
-      }
-      startcol -= head_off;
-    }
-    compl_col += ++startcol;
-    compl_length = (int)curs_col - startcol;
-    if (compl_length == 1) {
-      // Only match word with at least two chars -- webb
-      // there's no need to call quote_meta,
-      // xmalloc(7) is enough  -- Acevedo
-      compl_pattern = xmalloc(7);
-      STRCPY(compl_pattern, "\\<");
-      quote_meta(compl_pattern + 2, line + compl_col, 1);
-      strcat(compl_pattern, "\\k");
-    } else {
-      compl_pattern = xmalloc(quote_meta(NULL, line + compl_col, compl_length) + 2);
-      STRCPY(compl_pattern, "\\<");
-      quote_meta(compl_pattern + 2, line + compl_col, compl_length);
-    }
-  }
+    compl_patternlen = strlen(compl_pattern);
 
-  compl_patternlen = strlen(compl_pattern);
-
-  return OK;
+    return OK;
 }
 
 /// Get the pattern, column and length for whole line completion or for the

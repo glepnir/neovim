@@ -2627,6 +2627,13 @@ func Test_complete_fuzzy_match()
   call feedkeys("S\<C-x>\<C-o>fb\<C-n>", 'tx')
   call assert_equal('fooBaz', g:word)
 
+  set completeopt=fuzzy
+  call setline(1, ['xyz  yxz  x'])
+  exe "normal A\<C-N>"
+  call assert_equal('xyz  yxz  xyz', getline('.'))
+  exe "normal Sxyz yxz x\<C-N>\<C-N>"
+  call assert_equal('xyz  yxz  yxz', getline('.'))
+
   " clean up
   set omnifunc=
   bw!
