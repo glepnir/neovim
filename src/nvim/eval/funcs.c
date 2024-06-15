@@ -4656,11 +4656,11 @@ static void f_json_decode(typval_T *argvars, typval_T *rettv, EvalFuncData fptr)
 /// json_encode() function
 static void f_json_encode(typval_T *argvars, typval_T *rettv, EvalFuncData fptr)
 {
+  rettv->v_type = VAR_STRING;
   // Check if vim.json.encode exists
   if (!nlua_func_exists("vim.json.encode")) {
     emsg(_("E474: vim.json.encode does not exist"));
-    rettv->v_type = VAR_NUMBER;
-    rettv->vval.v_number = 0;
+    rettv->vval.v_string = "";
     return;
   }
 
@@ -4672,15 +4672,13 @@ static void f_json_encode(typval_T *argvars, typval_T *rettv, EvalFuncData fptr)
 
   if (ERROR_SET(&err) || result.type != kObjectTypeString) {
     semsg(_("E474: Failed to encode to JSON: %s"), err.msg ? err.msg : "unknown error");
-    rettv->v_type = VAR_NUMBER;
-    rettv->vval.v_number = 0;
+    rettv->vval.v_string = "";
   } else {
     // Retrieve the JSON string result from the Object
     object_to_vim(result, rettv, &err);
     if (ERROR_SET(&err)) {
       semsg(_("E474: Failed to convert JSON result to VimL: %s"), err.msg ? err.msg : "unknown error");
-      rettv->v_type = VAR_NUMBER;
-      rettv->vval.v_number = 0;
+      rettv->vval.v_string = "";
     }
   }
 

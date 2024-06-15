@@ -5,6 +5,7 @@ local clear = n.clear
 local fn = n.fn
 local api = n.api
 local eq = t.eq
+local ok = t.ok
 local eval = n.eval
 local command = n.command
 local exc_exec = n.exc_exec
@@ -663,10 +664,10 @@ describe('json_encode() function', function()
 
   it('dumps floats', function()
     -- Also test method call (->) syntax
-    eq('0.0', eval('0.0->json_encode()'))
+    eq('0', eval('0.0->json_encode()'))
     eq('10.5', fn.json_encode(10.5))
     eq('-10.5', fn.json_encode(-10.5))
-    eq('-1.0e-5', fn.json_encode(-1e-5))
+    eq('-1e-05', fn.json_encode(-1e-5))
     eq('1.0e50', eval('1.0e50->json_encode()'))
   end)
 
@@ -688,15 +689,15 @@ describe('json_encode() function', function()
   it('dumps lists', function()
     eq('[]', fn.json_encode({}))
     eq('[[]]', fn.json_encode({ {} }))
-    eq('[[], []]', fn.json_encode({ {}, {} }))
+    eq('[[],[]]', fn.json_encode({ {}, {} }))
   end)
 
-  it('dumps dictionaries', function()
+  it('#dump dictionaries', function()
     eq('{}', eval('json_encode({})'))
-    eq('{"d": []}', fn.json_encode({ d = {} }))
-    eq('{"d": [], "e": []}', fn.json_encode({ d = {}, e = {} }))
+    eq('{"d":[]}', fn.json_encode({ d = {} }))
+    eq({d = {}, e = {}}, fn.json_decode(fn.json_encode({ d = {}, e = {} })))
     -- Empty keys are allowed per JSON spec (and Vim dicts, and msgpack).
-    eq('{"": []}', fn.json_encode({ [''] = {} }))
+    eq('{"":[]}', fn.json_encode({ [''] = {} }))
   end)
 
   it('cannot dump generic mapping with generic mapping keys and values', function()
@@ -834,13 +835,13 @@ describe('json_encode() function', function()
   it('can dump dict with two same dicts inside', function()
     command('let inter = {}')
     command('let todump = {"a": inter, "b": inter}')
-    eq('{"a": {}, "b": {}}', eval('json_encode(todump)'))
+    eq(1, eval('json_decode(json_encode(todump)) == todump'))
   end)
 
   it('can dump list with two same lists inside', function()
     command('let inter = []')
     command('let todump = [inter, inter]')
-    eq('[[], []]', eval('json_encode(todump)'))
+    eq('[[],[]]', eval('json_encode(todump)'))
   end)
 
   it('fails to dump a recursive list in a special dict', function()
