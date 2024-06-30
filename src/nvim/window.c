@@ -1429,6 +1429,7 @@ win_T *win_split_ins(int size, int flags, win_T *new_wp, int dir, frame_T *to_fl
     frame_fix_width(wp);
   } else {
     const bool is_stl_global = global_stl_height() > 0;
+    const bool stl_bottom_only = p_ls == 4;
     // width and column of new window is same as current window
     if (toplevel) {
       wp->w_wincol = 0;
@@ -1446,7 +1447,7 @@ win_T *win_split_ins(int size, int flags, win_T *new_wp, int dir, frame_T *to_fl
     win_new_height(wp, new_size);
     const int old_status_height = oldwin->w_status_height;
     if (before) {
-      wp->w_hsep_height = is_stl_global ? 1 : 0;
+      wp->w_hsep_height = (is_stl_global || p_ls == 4) ? 1 : 0;
     } else {
       wp->w_hsep_height = oldwin->w_hsep_height;
       oldwin->w_hsep_height = is_stl_global ? 1 : 0;
@@ -1474,7 +1475,7 @@ win_T *win_split_ins(int size, int flags, win_T *new_wp, int dir, frame_T *to_fl
 
     if (before) {       // new window above current one
       wp->w_winrow = oldwin->w_winrow;
-      if (is_stl_global) {
+      if (is_stl_global || stl_bottom_only) {
         wp->w_status_height = 0;
         oldwin->w_winrow += wp->w_height + 1;
       } else {
@@ -3508,6 +3509,26 @@ static bool is_bottom_win(win_T *wp)
   }
   return true;
 }
+
+/// Check if wp is the last vertical window below the current window.
+bool last_vert_win(win_T *wp)
+{
+  if (!is_bottom_win(wp)) {
+    return false;
+  }
+
+  win_T *prev = wp->w_prev;
+  while (prev != NULL) {
+    if (prev == curwin) {
+      return true;
+    }
+    prev = prev->w_prev;
+  }
+
+  return false;
+}
+
+
 /// Set a new height for a frame.  Recursively sets the height for contained
 /// frames and windows.  Caller must take care of positions.
 ///

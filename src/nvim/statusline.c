@@ -69,6 +69,10 @@ void win_redr_status(win_T *wp)
 {
   int attr;
   bool is_stl_global = global_stl_height() > 0;
+  bool win_stl_bottom = p_ls == 4 && last_vert_win(wp);
+  if (win_stl_bottom) {
+    wp = curwin;
+  }
   static bool busy = false;
 
   // May get here recursively when 'statusline' (indirectly)
@@ -81,7 +85,7 @@ void win_redr_status(win_T *wp)
   busy = true;
 
   wp->w_redr_status = false;
-  if (wp->w_status_height == 0 && !(is_stl_global && wp == curwin)) {
+  if (wp->w_status_height == 0 && !((is_stl_global || win_stl_bottom) && wp == curwin)) {
     // no status line, either global statusline is enabled or the window is a last window
     redraw_cmdline = true;
   } else if (!redrawing()) {
@@ -150,8 +154,8 @@ void win_redr_status(win_T *wp)
       }
     }
 
-    grid_line_start(&default_grid, is_stl_global ? (Rows - (int)p_ch - 1) : W_ENDROW(wp));
-    const int off = is_stl_global ? 0 : wp->w_wincol;
+    grid_line_start(&default_grid, (is_stl_global || win_stl_bottom) ? (Rows - (int)p_ch - 1) : W_ENDROW(wp));
+    const int off = (is_stl_global || win_stl_bottom) ? 0 : wp->w_wincol;
 
     int width = grid_line_puts(off, p, -1, attr);
     grid_line_fill(off + width, off + this_ru_col, fillchar, attr);

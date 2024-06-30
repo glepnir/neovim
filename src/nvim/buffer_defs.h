@@ -1045,12 +1045,12 @@ struct window_S {
 
   int w_hl_needs_update;            ///< attrs need to be recalculated
 
-  win_T *w_prev;              ///< link to previous window
-  win_T *w_next;              ///< link to next window
+  win_T *w_prev;                    ///< link to previous window
+  win_T *w_next;                    ///< link to next window
   bool w_closing;                   ///< window is being closed, don't let
                                     ///< autocommands close it too.
 
-  frame_T *w_frame;             ///< frame containing this window
+  frame_T *w_frame;                 ///< frame containing this window
 
   pos_T w_cursor;                   ///< cursor position in buffer
 
