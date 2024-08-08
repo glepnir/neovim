@@ -1455,6 +1455,7 @@ static void win_update(win_T *wp)
     DID_NONE = 1,  // didn't update a line
     DID_LINE = 2,  // updated a normal line
     DID_FOLD = 3,  // updated a folded line
+    DID_CONCEAL = 4, // update a conceal line
   } did_update = DID_NONE;
 
   linenr_T syntax_last_parsed = 0;              // last parsed text line
@@ -2043,6 +2044,13 @@ static void win_update(win_T *wp)
     // Remember the starting row of the line that is going to be dealt
     // with.  It is used further down when the line doesn't fit.
     srow = row;
+
+    if (idx < wp->w_lines_valid && wp->w_lines[idx].wl_hide) {
+      // Skip rendering the concealed line and move to the next line
+      lnum++;
+      idx++;
+      continue;
+    }
 
     // Update a line when it is in an area that needs updating, when it
     // has changes or w_lines[idx] is invalid.

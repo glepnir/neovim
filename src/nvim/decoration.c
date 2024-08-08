@@ -12,6 +12,7 @@
 #include "nvim/buffer_defs.h"
 #include "nvim/change.h"
 #include "nvim/decoration.h"
+#include "nvim/decoration_defs.h"
 #include "nvim/drawscreen.h"
 #include "nvim/extmark.h"
 #include "nvim/fold.h"
@@ -111,6 +112,19 @@ void decor_redraw(buf_T *buf, int row1, int row2, int col1, DecorInline decor)
       DecorSignHighlight *sh = &kv_A(decor_items, idx);
       decor_redraw_sh(buf, row1, row2, *sh);
       idx = sh->next;
+    }
+  } else if (decor.data.hl.flags & kSHConcealLine) {
+    FOR_ALL_TAB_WINDOWS(tp, wp) {
+      if (wp->w_buffer == buf) {
+        if (row1 < wp->w_lines_valid) {
+          wp->w_lines[row1].wl_hide = true;
+          wp->w_lines[row1].wl_valid = true;
+          wp->w_lines[row1].wl_lastlnum--;
+          // wp->w_lines[row1].wl_size--;
+          // redraw_buf_line_later(buf, row1, true);
+          redraw_later(wp, UPD_NOT_VALID);
+        }
+      }
     }
   } else {
     decor_redraw_sh(buf, row1, row2, decor_sh_from_inline(decor.data.hl));

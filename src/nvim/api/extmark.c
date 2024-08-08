@@ -579,6 +579,14 @@ Integer nvim_buf_set_extmark(Buffer buffer, Integer ns_id, Integer line, Integer
     }
   }
 
+  if (HAS_KEY(opts, set_extmark, conceal_line)) {
+    if (!strequal(opts->conceal_line.data, "hide")) {
+      api_set_error(err, kErrorTypeValidation, "conceal_line only support hide");
+      goto error;
+    }
+    hl.flags |= kSHConcealLine;
+  }
+
   if (HAS_KEY(opts, set_extmark, virt_text)) {
     virt_text.data.virt_text = parse_virt_text(opts->virt_text, err, &virt_text.width);
     if (ERROR_SET(err)) {

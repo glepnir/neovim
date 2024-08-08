@@ -816,6 +816,7 @@ typedef struct {
   char wl_valid;                // true values are valid for text in buffer
   char wl_folded;               // true when this is a range of folded lines
   linenr_T wl_lastlnum;         // last buffer line number for logical line
+  char wl_hide;                 // buffer line is hide
 } wline_T;
 
 // Windows are kept in a tree of frames.  Each frame has a column (FR_COL)
