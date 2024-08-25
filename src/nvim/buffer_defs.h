@@ -205,7 +205,8 @@ typedef struct {
 #define w_p_fcs w_onebuf_opt.wo_fcs    // 'fillchars'
   OptInt wo_winbl;
 #define w_p_winbl w_onebuf_opt.wo_winbl  // 'winblend'
-
+  char *wo_winbd;
+#define w_p_winbd w_onebuf_opt.wo_winbd   // 'winborder'
   LastSet wo_script_ctx[WV_COUNT];        // SCTXs for window-local options
 #define w_p_script_ctx w_onebuf_opt.wo_script_ctx
 } winopt_T;

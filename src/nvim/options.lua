@@ -10192,5 +10192,19 @@ return {
       type = 'number',
       varname = 'p_wd',
     },
+    {
+      abbreviation = 'winbd',
+      defaults = { if_true = '' },
+      cb = 'did_set_winborder',
+      desc = [=[
+        Setting border of floating window.
+      ]=],
+      full_name = 'winborder',
+      scope = { 'window' },
+      redraw = { 'current_window' },
+      short_desc = N_('border of floating window'),
+      type = 'string',
+      varname = 'p_winbd',
+    },
   },
 }

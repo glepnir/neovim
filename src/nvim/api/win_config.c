@@ -931,7 +931,7 @@ static bool parse_bordertext_pos(String bordertext_pos, BorderTextType bordertex
   return true;
 }
 
-static void parse_border_style(Object style, WinConfig *fconfig, Error *err)
+void parse_border_style(Object style, WinConfig *fconfig, Error *err)
 {
   struct {
     const char *name;
@@ -1278,12 +1278,15 @@ static bool parse_win_config(win_T *wp, Dict(win_config) *config, WinConfig *fco
     }
   }
 
-  if (HAS_KEY_X(config, border)) {
+  if (HAS_KEY_X(config, border) || *p_winbd != NUL) {
     if (is_split) {
       api_set_error(err, kErrorTypeValidation, "non-float cannot have 'border'");
       return false;
     }
-    parse_border_style(config->border, fconfig, err);
+    Object style = (config->border.type == kObjectTypeArray
+                    || config->border.type ==
+                    kObjectTypeString) ? config->border : CSTR_AS_OBJ(p_winbd);
+    parse_border_style(style, fconfig, err);
     if (ERROR_SET(err)) {
       return false;
     }

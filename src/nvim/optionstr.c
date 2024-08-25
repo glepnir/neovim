@@ -3,6 +3,9 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "nvim/api/private/defs.h"
+#include "nvim/api/private/helpers.h"
+#include "nvim/api/win_config.h"
 #include "nvim/ascii_defs.h"
 #include "nvim/autocmd.h"
 #include "nvim/buffer_defs.h"
@@ -48,6 +51,7 @@
 #include "nvim/types_defs.h"
 #include "nvim/vim_defs.h"
 #include "nvim/window.h"
+#include "nvim/winfloat.h"
 
 #ifdef INCLUDE_GENERATED_DECLARATIONS
 # include "optionstr.c.generated.h"
@@ -144,6 +148,9 @@ static char *(p_tpf_values[]) = { "BS", "HT", "FF", "ESC", "DEL", "C0", "C1", NU
 static char *(p_rdb_values[]) = { "compositor", "nothrottle", "invalid", "nodelta", "line",
                                   "flush", NULL };
 static char *(p_sloc_values[]) = { "last", "statusline", "tabline", NULL };
+
+static char *(p_winbd_values[]) = { "single", "double", "none", "rounded", "solid", "shadow",
+                                    NULL };
 
 /// All possible flags for 'shm'.
 /// the literal chars before 0 are removed flags. these are safely ignored
@@ -2501,6 +2508,29 @@ const char *did_set_winhighlight(optset_T *args)
   if (!parse_winhl_opt(win)) {
     return e_invarg;
   }
+  return NULL;
+}
+
+/// The 'winborder' optioon is changed.
+const char *did_set_winborder(optset_T *args)
+{
+  if (check_opt_strings(args->os_newval.string.data, p_winbd_values, false) == false) {
+    return e_invarg;
+  }
+  win_T *wp = (win_T *)args->os_win;
+  char *border_style = xstrdup(args->os_newval.string.data);
+  if (wp && !wp->w_floating) {
+    p_winbd = border_style;
+    return NULL;
+  }
+  wp->w_p_winbd = border_style;
+  Error err = ERROR_INIT;
+  parse_border_style(CSTR_TO_OBJ(wp->w_p_winbd), &wp->w_config, &err);
+  if (ERROR_SET(&err)) {
+    emsg(err.msg);
+    api_clear_error(&err);
+  }
+  win_config_float(wp, wp->w_config);
   return NULL;
 }
 

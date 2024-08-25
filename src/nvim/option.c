@@ -4908,6 +4908,8 @@ void *get_varp_from(vimoption_T *p, buf_T *buf, win_T *win)
     return &(win->w_p_winbl);
   case PV_STC:
     return &(win->w_p_stc);
+  case PV_WINBD:
+    return &(win->w_p_winbd);
   default:
     iemsg(_("E356: get_varp ERROR"));
   }
