@@ -2679,6 +2679,7 @@ static int command_line_changed(CommandLineState *s)
       && curbuf->b_p_ma      // buffer is modifiable
       && cmdline_star == 0   // not typing a password
       && !vpeekc_any()
+      && s->xpc.xp_numfiles > 0
       && cmdpreview_may_show(s)) {
     // 'inccommand' preview has been shown.
   } else {
