@@ -705,6 +705,11 @@ int hl_blend_attrs(int back_attr, int front_attr, bool *through)
 
   HlAttrs fattrs = get_colors_force(front_attr);
   int ratio = fattrs.hl_blend;
+  if (ratio == 100) {
+    // If *through is true, it's a background element; otherwise, it's a foreground element.
+    return *through ? back_attr : front_attr;
+  }
+
   if (ratio <= 0) {
     *through = false;
     return front_attr;
