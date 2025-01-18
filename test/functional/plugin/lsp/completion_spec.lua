@@ -216,7 +216,7 @@ describe('vim.lsp.completion: item conversion', function()
       })
     end)
 
-    it('uses filterText as word if label/newText would not match', function()
+    it('#uses filterText as word if label/newText would not match', function()
       local items = {
         {
           filterText = '<module',
@@ -454,13 +454,37 @@ describe('vim.lsp.completion: item conversion', function()
 
   it('works on non word prefix', function()
     local completion_list = {
-      { label = ' foo', insertText = '->foo' },
+      items = {
+        {
+          detail = 'colnr_T',
+          filterText = 'w_virtcol',
+          insertText = '->w_virtcol',
+          insertTextFormat = 1,
+          kind = 5,
+          label = ' w_virtcol',
+          score = 0.59581798315048,
+          sortText = '40e77879w_virtcol',
+          textEdit = {
+            newText = '->w_virtcol',
+            range = {
+              ['end'] = {
+                character = 0,
+                line = 0,
+              },
+              start = {
+                character = 0,
+                line = 0,
+              },
+            },
+          },
+        },
+      },
     }
-    local result = complete('wp.|', completion_list, 0, 2)
+    local result = complete('.|', completion_list)
     local expected = {
       {
-        abbr = ' foo',
-        word = '->foo',
+        abbr = ' w_virtcol',
+        word = 'w_virtcol',
       },
     }
     result = vim.tbl_map(function(x)

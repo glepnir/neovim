@@ -161,7 +161,11 @@ local function get_completion_word(item, prefix, match)
     end
   elseif item.textEdit then
     local word = item.textEdit.newText
-    return word:match('^(%S*)') or word
+    word = word:match('^(%S*)') or word
+    if item.filterText and not match(word, prefix) then
+      return item.filterText
+    end
+    return word
   elseif item.insertText and item.insertText ~= '' then
     return item.insertText
   end
@@ -441,7 +445,7 @@ local function trigger(bufnr, clients)
   reset_timer()
   Context:cancel_pending()
 
-  if tonumber(vim.fn.pumvisible()) == 1 and not Context.isIncomplete then
+  if tonumber(vim.fn.pumvisible()) == 1 then
     return
   end
 
@@ -470,7 +474,7 @@ local function trigger(bufnr, clients)
     local server_start_boundary --- @type integer?
     for client_id, response in pairs(responses) do
       if response.err then
-        vim.notify_once(response.err.message, vim.log.levels.warn)
+        vim.notify_once(response.err.message, vim.log.levels.WARN)
       end
 
       local result = response.result
@@ -492,7 +496,7 @@ local function trigger(bufnr, clients)
         vim.list_extend(matches, client_matches)
       end
     end
-    local start_col = (server_start_boundary or word_boundary) + 1
+    local start_col = math.max(server_start_boundary or 0, word_boundary) + 1
     vim.fn.complete(start_col, matches)
   end)
 
@@ -564,7 +568,7 @@ local function on_complete_done()
   local resolve_provider = (client.server_capabilities.completionProvider or {}).resolveProvider
 
   local function clear_word()
-    if not expand_snippet then
+    if not expand_snippet and not completion_item.textEdit then
       return nil
     end
 
@@ -609,6 +613,14 @@ local function on_complete_done()
 
       apply_snippet_and_command()
     end, bufnr)
+  elseif completion_item.textEdit then
+    clear_word()
+    local _col = api.nvim_win_get_cursor(0)[2] - 1
+    lsp.util.apply_text_edits({ completion_item.textEdit }, bufnr, position_encoding)
+    api.nvim_win_set_cursor(
+      0,
+      { cursor_row + 1, _col + vim.fn.strdisplaywidth(completion_item.textEdit.newText) }
+    )
   else
     clear_word()
     apply_snippet_and_command()
