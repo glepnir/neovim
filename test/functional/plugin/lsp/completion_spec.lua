@@ -168,6 +168,71 @@ describe('vim.lsp.completion: item conversion', function()
     eq(expected, result)
   end)
 
+  it('uses exists highlight group for kind', function()
+    local completion_list = {
+      { label = 'Text', kind = 1 },
+      { label = 'Method', kind = 2 },
+      { label = 'Function', kind = 3 },
+      { label = 'Constructor', kind = 4 },
+      { label = 'Field', kind = 5 },
+      { label = 'Variable', kind = 6 },
+      { label = 'Class', kind = 7 },
+      { label = 'Interface', kind = 8 },
+      { label = 'Module', kind = 9 },
+      { label = 'Property', kind = 10 },
+      { label = 'Unit', kind = 11 },
+      { label = 'Value', kind = 12 },
+      { label = 'Enum', kind = 13 },
+      { label = 'Keyword', kind = 14 },
+      { label = 'Snippet', kind = 15 },
+      { label = 'Color', kind = 16 },
+      { label = 'File', kind = 17 },
+      { label = 'Reference', kind = 18 },
+      { label = 'Folder', kind = 19 },
+      { label = 'EnumMember', kind = 20 },
+      { label = 'Constant', kind = 21 },
+      { label = 'Struct', kind = 22 },
+      { label = 'Event', kind = 23 },
+      { label = 'Operator', kind = 24 },
+      { label = 'TypeParameter', kind = 25 },
+    }
+    local expected = {
+      { word = 'Text', kind_hlgroup = '' },
+      { word = 'Method', kind_hlgroup = '@lsp.type.method' },
+      { word = 'Function', kind_hlgroup = '@lsp.type.function' },
+      { word = 'Constructor', kind_hlgroup = '@constructor' },
+      { word = 'Field', kind_hlgroup = '' },
+      { word = 'Variable', kind_hlgroup = '@lsp.type.variable' },
+      { word = 'Class', kind_hlgroup = '@class' },
+      { word = 'Interface', kind_hlgroup = '@interface' },
+      { word = 'Module', kind_hlgroup = '@module' },
+      { word = 'Property', kind_hlgroup = '@lsp.type.property' },
+      { word = 'Unit', kind_hlgroup = '' },
+      { word = 'Value', kind_hlgroup = '' },
+      { word = 'Enum', kind_hlgroup = '@enum' },
+      { word = 'Keyword', kind_hlgroup = '@lsp.type.keyword' },
+      { word = 'Snippet', kind_hlgroup = '' },
+      { word = 'Color', kind_hlgroup = '' },
+      { word = 'File', kind_hlgroup = '' },
+      { word = 'Reference', kind_hlgroup = '' },
+      { word = 'Folder', kind_hlgroup = '' },
+      { word = 'EnumMember', kind_hlgroup = '@lsp.type.enumMember' },
+      { word = 'Constant', kind_hlgroup = '@constant' },
+      { word = 'Struct', kind_hlgroup = '@lsp.type.struct' },
+      { word = 'Event', kind_hlgroup = '@lsp.type.event' },
+      { word = 'Operator', kind_hlgroup = '@lsp.type.operator' },
+      { word = 'TypeParameter', kind_hlgroup = '@lsp.type.typeParameter' },
+    }
+    local result = complete('|', completion_list)
+    result = vim.tbl_map(function(x)
+      return {
+        word = x.word,
+        kind_hlgroup = x.kind_hlgroup,
+      }
+    end, result.items)
+    neq(expected, result)
+  end)
+
   ---@param prefix string
   ---@param items lsp.CompletionItem[]
   ---@param expected table[]
@@ -618,6 +683,7 @@ describe('vim.lsp.completion: item conversion', function()
       kind = 'Module',
       menu = '',
       abbr_hlgroup = '',
+      kind_hlgroup = '@module',
       word = 'this_thread',
     }
     local result = complete('  std::this|', completion_list)
@@ -672,6 +738,7 @@ describe('vim.lsp.completion: item conversion', function()
       icase = 1,
       info = '',
       kind = 'Module',
+      kind_hlgroup = '@module',
       menu = '',
       abbr_hlgroup = '',
       word = 'this_thread',

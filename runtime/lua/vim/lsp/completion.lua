@@ -244,6 +244,27 @@ local function match_item_by_value(value, prefix)
   return vim.startswith(value, prefix)
 end
 
+--- Generate the highlight group name for LSP completion item kind.
+--- Checks for the existence of specific highlight groups
+--- and returns the appropriate names table if available.
+---
+--- @return table<integer, string>
+local function generate_kind_hlgroup()
+  local highlights = {}
+  for index, kind in ipairs(lsp.protocol.CompletionItemKind) do
+    kind = kind:gsub('^.', string.lower)
+    for _, fmt in ipairs({ ('@lsp.type.%s'):format(kind), ('@%s'):format(kind) }) do
+      if next(vim.api.nvim_get_hl(0, { name = fmt })) ~= nil then
+        highlights[index] = fmt
+        break
+      end
+    end
+    highlights[index] = highlights[index] or ''
+  end
+
+  return highlights
+end
+
 --- Turns the result of a `textDocument/completion` request into vim-compatible
 --- |complete-items|.
 ---
@@ -284,6 +305,7 @@ function M._lsp_to_complete_items(result, prefix, client_id)
   local candidates = {}
   local bufnr = api.nvim_get_current_buf()
   local user_convert = vim.tbl_get(buf_handles, bufnr, 'convert')
+  local kind_highlights = generate_kind_hlgroup()
   for _, item in ipairs(items) do
     if matches(item) then
       local word = get_completion_word(item, prefix, match_item_by_value)
@@ -304,6 +326,7 @@ function M._lsp_to_complete_items(result, prefix, client_id)
         dup = 1,
         empty = 1,
         abbr_hlgroup = hl_group,
+        kind_hlgroup = kind_highlights[item.kind],
         user_data = {
           nvim = {
             lsp = {
