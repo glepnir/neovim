@@ -244,6 +244,44 @@ local function match_item_by_value(value, prefix)
   return vim.startswith(value, prefix)
 end
 
+--- Generate the highlight group name for LSP completion item kind.
+--- Checks for the existence of specific highlight groups
+--- and returns the appropriate kind and kind_hlgroup
+---
+--- @param item lsp.CompletionItem
+--- @return string|nil, string|nil
+local function generate_kind(item)
+  local kind = lsp.protocol.CompletionItemKind[item.kind]
+  if not kind then
+    return
+  end
+
+  if item.kind == lsp.protocol.CompletionItemKind.Color then
+    local doc = get_doc(item)
+    if #doc > 0 then
+      local r, g, b = doc:match('rgb%((%d+)%s*,?%s*(%d+)%s*,?%s*(%d+)%)')
+      if r then
+        local color = string.format('%02x%02x%02x', tonumber(r), tonumber(g), tonumber(b))
+        local group = ('@lsp.color.%s'):format(color)
+        if vim.fn.hlID(group) < 1 then
+          api.nvim_set_hl(0, group, { fg = '#' .. color })
+        end
+        return '■', group
+      end
+    end
+  end
+
+  local lower = kind:gsub('^.', string.lower)
+  local group = ''
+  for _, fmt in ipairs({ kind, ('@lsp.type.%s'):format(lower), ('@%s'):format(lower) }) do
+    if next(vim.api.nvim_get_hl(0, { name = fmt })) ~= nil then
+      group = fmt
+      break
+    end
+  end
+  return kind, group
+end
+
 --- Turns the result of a `textDocument/completion` request into vim-compatible
 --- |complete-items|.
 ---
@@ -294,16 +332,18 @@ function M._lsp_to_complete_items(result, prefix, client_id)
       then
         hl_group = 'DiagnosticDeprecated'
       end
+      local kind, kind_hlgroup = generate_kind(item)
       local completion_item = {
         word = word,
         abbr = item.label,
-        kind = protocol.CompletionItemKind[item.kind] or 'Unknown',
+        kind = kind,
         menu = item.detail or '',
         info = get_doc(item),
         icase = 1,
         dup = 1,
         empty = 1,
         abbr_hlgroup = hl_group,
+        kind_hlgroup = kind_hlgroup,
         user_data = {
           nvim = {
             lsp = {
