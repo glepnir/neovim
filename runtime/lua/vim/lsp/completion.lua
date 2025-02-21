@@ -155,6 +155,11 @@ local function get_completion_word(item, prefix, match)
         return word
       end
     elseif item.insertText and item.insertText ~= '' then
+      local word = parse_snippet(item.insertText)
+      if vim.o.completeopt:find('popup') and #(item.documentation or '') == 0 then
+        item.documentation = ('```%s\n%s\n```'):format(vim.bo.filetype, word)
+        return item.label
+      end
       return parse_snippet(item.insertText)
     else
       return item.label
