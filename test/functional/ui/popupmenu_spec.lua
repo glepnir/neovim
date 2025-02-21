@@ -1685,11 +1685,12 @@ describe('builtin popupmenu', function()
         --row must > 10
         screen:try_resize(40, 11)
         exec([[
+          let g:list = [#{word: "one", info: "1info"}, #{word: "two", info: "2info"}, #{word: "looooooooooooooong"}]
           funct Omni_test(findstart, base)
             if a:findstart
               return col(".") - 1
             endif
-            return [#{word: "one", info: "1info"}, #{word: "two", info: "2info"}, #{word: "looooooooooooooong"}]
+            return g:list
           endfunc
           set omnifunc=Omni_test
           set completeopt=menu,popup
@@ -1715,6 +1716,9 @@ describe('builtin popupmenu', function()
           funct TestTs()
             autocmd! Group
             autocmd CompleteChanged * call TsHl()
+          endfunc
+          funct Append_multipe()
+            call extend(g:list, [#{word: "for .. ipairs", info: "```lua\nfor index, value in ipairs(t) do\n\t\nend\n```"}])
           endfunc
         ]])
         feed('Gi<C-x><C-o>')
@@ -2103,6 +2107,104 @@ describe('builtin popupmenu', function()
             ]],
           })
         end
+        feed('<C-E><ESC>')
+
+        -- avoid modified original info text
+        command('call Append_multipe()')
+        feed('S<C-x><C-o><C-N><C-N><C-N>')
+        if multigrid then
+          screen:expect({
+            grid = [[
+            ## grid 1
+              [2:----------------------------------------]|*10
+              [3:----------------------------------------]|
+            ## grid 2
+              for .. ipairs^                           |
+              {1:~                                       }|*9
+            ## grid 3
+              {2:-- }{5:match 4 of 4}                         |
+            ## grid 5
+              {n:one                }|
+              {n:two                }|
+              {n:looooooooooooooong }|
+              {s:for .. ipairs      }|
+            ## grid 11
+              {n:```lua              }|
+              {n:for index, value in }|
+              {n:ipairs(t) do        }|
+              {n:                    }|
+              {n:end                 }|
+              {n:```                 }|
+            ]],
+            win_pos = {
+              [2] = {
+                height = 10,
+                startcol = 0,
+                startrow = 0,
+                width = 40,
+                win = 1000,
+              },
+            },
+            float_pos = {
+              [5] = { -1, 'NW', 2, 1, 0, false, 100 },
+              [11] = { 1007, 'NW', 1, 1, 19, false, 50 },
+            },
+            win_viewport = {
+              [2] = {
+                win = 1000,
+                topline = 0,
+                botline = 2,
+                curline = 0,
+                curcol = 13,
+                linecount = 1,
+                sum_scroll_delta = 0,
+              },
+              [11] = {
+                win = 1007,
+                topline = 0,
+                botline = 5,
+                curline = 0,
+                curcol = 0,
+                linecount = 5,
+                sum_scroll_delta = 0,
+              },
+            },
+            win_viewport_margins = {
+              [2] = {
+                bottom = 0,
+                left = 0,
+                right = 0,
+                top = 0,
+                win = 1000,
+              },
+              [11] = {
+                bottom = 0,
+                left = 0,
+                right = 0,
+                top = 0,
+                win = 1007,
+              },
+            },
+          })
+        else
+          screen:expect([[
+            for .. ipairs^                           |
+            {n:one                ```lua              }{1: }|
+            {n:two                for index, value in }{1: }|
+            {n:looooooooooooooong ipairs(t) do        }{1: }|
+            {s:for .. ipairs      }{n:                    }{1: }|
+            {1:~                  }{n:end                 }{1: }|
+            {1:~                  }{n:```                 }{1: }|
+            {1:~                                       }|*3
+            {2:-- }{5:match 4 of 4}                         |
+          ]])
+        end
+
+        feed('<C-N><C-N><C-N><C-N><C-N>')
+        if not multigrid then
+          screen:expect_unchanged()
+        end
+        feed('<C-E><ESC>')
       end)
     end)
 
