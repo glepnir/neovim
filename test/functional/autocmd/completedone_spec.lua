@@ -7,6 +7,7 @@ local call = n.call
 local feed = n.feed
 local eval = n.eval
 local eq = t.eq
+local exec = n.exec
 
 describe('CompleteDone', function()
   before_each(clear)
@@ -37,5 +38,25 @@ describe('CompleteDone', function()
         eq('cancel', eval('g:donereason'))
       end)
     end)
+  end)
+
+  it('Do not set the reason when preparing completion with space', function()
+    exec([[
+      func Omni_test(findstart, base)
+        if a:findstart
+          return col(".")
+        endif
+        call timer_start(100, {->complete(col('.'), [#{word: "foo"}, #{word: "bar"}])})
+        return -2
+      endfunc
+      set omnifunc=Omni_test
+      let g:reason_list = []
+      autocmd CompleteDone * call add(g:reason_list, get(v:event, 'reason', ''))
+    ]])
+    command('lua vim.wait(150)')
+    feed('S<C-X><C-O><C-Y>')
+    vim.uv.sleep(150)
+    eq({''}, eval('g:reason_list'))
+    eq(1, eval('pumvisible()'))
   end)
 end)

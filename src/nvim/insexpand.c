@@ -581,7 +581,9 @@ static void do_autocmd_completedone(int c, int mode, char *word)
   tv_dict_add_str(v_event, S_LEN("complete_word"), word != NULL ? word : "");
   tv_dict_add_str(v_event, S_LEN("complete_type"), mode_str != NULL ? mode_str : "");
 
-  tv_dict_add_str(v_event, S_LEN("reason"), (c == Ctrl_Y ? "accept" : "cancel"));
+  if (c != ' ') {
+    tv_dict_add_str(v_event, S_LEN("reason"), (c == Ctrl_Y ? "accept" : "cancel"));
+  }
   tv_dict_set_keys_readonly(v_event);
 
   ins_apply_autocmds(EVENT_COMPLETEDONE);
