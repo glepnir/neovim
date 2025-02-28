@@ -630,6 +630,54 @@ local function get_augroup(bufnr)
   return string.format('nvim.lsp.completion_%d', bufnr)
 end
 
+local function debounce_request()
+  local timer = nil -- [[uv_timer_t]]
+  return function(bufnr, param, select_word)
+    if timer and timer:is_active() and not timer:is_closing() then
+      timer:stop()
+      timer:close()
+      timer = nil
+    end
+
+    timer = assert(vim.uv.new_timer())
+    timer:start(
+      100,
+      0,
+      vim.schedule_wrap(function()
+        lsp.buf_request(bufnr, ms.completionItem_resolve, param, function(err, result, ctx)
+          if err or next(result) == nil then
+            return err and vim.notify(err.message, vim.log.levels.WARN) or nil
+          end
+          local value = vim.tbl_get(result or {}, 'documentation', 'value')
+          if not value or api.nvim_get_current_buf() ~= ctx.bufnr then
+            return
+          end
+          local data = vim.fn.complete_info({ 'selected', 'completed' })
+          if not data.completed or select_word ~= data.completed.word then
+            return
+          end
+
+          local windata = api.nvim__complete_set(data.selected, {
+            info = value,
+          })
+
+          if api.nvim_win_is_valid(windata.winid) and api.nvim_buf_is_loaded(windata.bufnr) then
+            local kind = vim.tbl_get(result or {}, 'documentation', 'kind')
+            if kind == lsp.protocol.MarkupKind.Markdown then
+              vim.wo[windata.winid].conceallevel = 2
+            end
+            vim.bo[windata.bufnr].filetype = kind
+            local all = api.nvim_win_text_height(windata.winid, {}).all
+            api.nvim_win_set_height(windata.winid, all)
+          end
+        end)
+      end)
+    )
+  end
+end
+
+local debounce_info_request = debounce_request()
+
 --- @class vim.lsp.completion.BufferOpts
 --- @field autotrigger? boolean  Default: false When true, completion triggers automatically based on the server's `triggerCharacters`.
 --- @field convert? fun(item: lsp.CompletionItem): table Transforms an LSP CompletionItem to |complete-items|.
@@ -665,6 +713,35 @@ local function enable_completions(client_id, bufnr, opts)
         end
       end,
     })
+
+    if vim.o.completeopt:find('popup') then
+      api.nvim_create_autocmd('CompleteChanged', {
+        group = group,
+        buffer = bufnr,
+        callback = function(args)
+          local completed_item = api.nvim_get_vvar('event').completed_item or {}
+          if (completed_item.info or '') ~= '' then
+            local data = vim.fn.complete_info({ 'selected' })
+            local p_winid = data.preview_winid --- @type integer
+            local p_bufnr = data.preview_bufnr --- @type integer
+            if p_winid and api.nvim_win_is_valid(p_winid) and api.nvim_buf_is_valid(p_bufnr) then
+              vim.wo[p_winid].conceallevel = 2
+            end
+            return
+          end
+          if
+            #vim.lsp.get_clients({ bufnr = args.buf, method = ms.completionItem_resolve }) == 0
+          then
+            return
+          end
+
+          local select_word = vim.v.event.completed_item.word
+          local param = vim.tbl_get(completed_item, 'user_data', 'nvim', 'lsp', 'completion_item')
+          debounce_info_request(args.buf, param, select_word)
+        end,
+      })
+    end
+
     if opts.autotrigger then
       api.nvim_create_autocmd('InsertCharPre', {
         group = group,
