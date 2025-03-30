@@ -10257,16 +10257,17 @@ local options = {
     },
     {
       defaults = { if_true = '' },
-      values = { '', 'double', 'single', 'shadow', 'rounded', 'solid', 'none' },
+      values = { '', 'bold', 'double', 'none', 'rounded', 'shadow', 'single', 'solid'},
       desc = [=[
         Defines the default border style of floating windows. The default value
         is empty, which is equivalent to "none". Valid values include:
-        - "none": No border.
-        - "single": A single line box.
+        - "bold": A bold line box.
         - "double": A double line box.
+        - "none": No border.
         - "rounded": Like "single", but with rounded corners ("╭" etc.).
-        - "solid": Adds padding by a single whitespace cell.
         - "shadow": A drop shadow effect by blending with the background.
+        - "single": A single line box.
+        - "solid": Adds padding by a single whitespace cell.
       ]=],
       full_name = 'winborder',
       scope = { 'global' },

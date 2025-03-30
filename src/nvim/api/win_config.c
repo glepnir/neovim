@@ -938,11 +938,12 @@ static void parse_border_style(Object style, WinConfig *fconfig, Error *err)
     char chars[8][MAX_SCHAR_SIZE];
     bool shadow_color;
   } defaults[] = {
-    { opt_winborder_values[1], { "╔", "═", "╗", "║", "╝", "═", "╚", "║" }, false },
-    { opt_winborder_values[2], { "┌", "─", "┐", "│", "┘", "─", "└", "│" }, false },
-    { opt_winborder_values[3], { "", "", " ", " ", " ", " ", " ", "" }, true },
+    { opt_winborder_values[2], { "╔", "═", "╗", "║", "╝", "═", "╚", "║" }, false },
+    { opt_winborder_values[6], { "┌", "─", "┐", "│", "┘", "─", "└", "│" }, false },
+    { opt_winborder_values[5], { "", "", " ", " ", " ", " ", " ", "" }, true },
     { opt_winborder_values[4], { "╭", "─", "╮", "│", "╯", "─", "╰", "│" }, false },
-    { opt_winborder_values[5], { " ", " ", " ", " ", " ", " ", " ", " " }, false },
+    { opt_winborder_values[7], { " ", " ", " ", " ", " ", " ", " ", " " }, false },
+    { opt_winborder_values[1], { "┏", "━", "┓", "┃", "┛", "━", "┗", "┃" }, false },
     { NULL, { { NUL } }, false },
   };
 
