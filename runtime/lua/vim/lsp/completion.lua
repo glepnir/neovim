@@ -473,7 +473,7 @@ end
 
 --- @param bufnr integer
 --- @param clients vim.lsp.Client[]
---- @param ctx? lsp.CompletionContext
+--- @param ctx lsp.CompletionContext
 local function trigger(bufnr, clients, ctx)
   reset_timer()
   Context:cancel_pending()
@@ -485,8 +485,7 @@ local function trigger(bufnr, clients, ctx)
   local win = api.nvim_get_current_win()
   local cursor_row, cursor_col = unpack(api.nvim_win_get_cursor(win)) --- @type integer, integer
   local line = api.nvim_get_current_line()
-  local line_to_cursor = line:sub(1, cursor_col)
-  local word_boundary = vim.fn.match(line_to_cursor, '\\k*$')
+  local word_boundary = ctx.startcol
   local start_time = vim.uv.hrtime()
   Context.last_request_time = start_time
 
@@ -534,56 +533,74 @@ local function trigger(bufnr, clients, ctx)
         vim.list_extend(matches, client_matches)
       end
     end
-    local start_col = (server_start_boundary or word_boundary) + 1
-    Context.cursor = { cursor_row, start_col }
-    vim.fn.complete(start_col, matches)
+
+    Context.cursor = { cursor_row, ctx.startcol }
+    vim.fn.complete(ctx.startcol, matches)
   end)
 
   table.insert(Context.pending_requests, cancel_request)
 end
 
---- @param handle vim.lsp.completion.BufHandle
-local function on_insert_char_pre(handle)
-  if tonumber(vim.fn.pumvisible()) == 1 then
-    if Context.isIncomplete then
-      reset_timer()
+local function trigger_wrapper(bufnr, handle, what_trigger, kind)
+  local triggers = vim.fn.complete_match()
+  kind = kind
+  local startcol = nil -- @type integer?
+  local char = nil
+  if #triggers == 0 then
+    if type(what_trigger) == 'table' and not what_trigger.any then
+      return
+    end
+    startcol = api.nvim_win_get_cursor(0)[2]
+    local line = api.nvim_get_current_line()
+    char = line:sub(startcol - 1, startcol)
+    if not char:find('%w') then
+      return
+    end
+    kind = not kind and protocol.CompletionTriggerKind.Invoked or kind
+  else
+    startcol, char = unpack(triggers[1]) --- @type integer, string
+    kind = not kind and protocol.CompletionTriggerKind.TriggerCharacter or kind
+  end
 
-      local debounce_ms = next_debounce()
-      local ctx = { triggerKind = protocol.CompletionTriggerKind.TriggerForIncompleteCompletions }
-      if debounce_ms == 0 then
-        vim.schedule(function()
-          M.get({ ctx = ctx })
+  trigger(bufnr, handle.clients, {
+    triggerKind = kind,
+    triggerCharacter = char,
+    startcol = startcol + 1,
+  })
+end
+
+local function on_text_changedi(bufnr, handle, what_trigger)
+  if vim.g.completion_menu_shown and Context.isIncomplete then
+    reset_timer()
+
+    local debounce_ms = next_debounce()
+    if debounce_ms == 0 then
+      trigger_wrapper(
+        bufnr,
+        handle,
+        what_trigger,
+        protocol.CompletionTriggerKind.TriggerForIncompleteCompletions
+      )
+    else
+      completion_timer = new_timer()
+      completion_timer:start(
+        debounce_ms,
+        0,
+        vim.schedule_wrap(function()
+          trigger_wrapper(
+            bufnr,
+            handle,
+            what_trigger,
+            protocol.CompletionTriggerKind.TriggerForIncompleteCompletions
+          )
         end)
-      else
-        completion_timer = new_timer()
-        completion_timer:start(
-          debounce_ms,
-          0,
-          vim.schedule_wrap(function()
-            M.get({ ctx = ctx })
-          end)
-        )
-      end
+      )
     end
 
     return
   end
 
-  local char = api.nvim_get_vvar('char')
-  local matched_clients = handle.triggers[char]
-  if not completion_timer and matched_clients then
-    completion_timer = assert(vim.uv.new_timer())
-    completion_timer:start(25, 0, function()
-      reset_timer()
-      vim.schedule(function()
-        trigger(
-          api.nvim_get_current_buf(),
-          matched_clients,
-          { triggerKind = protocol.CompletionTriggerKind.TriggerCharacter, triggerCharacter = char }
-        )
-      end)
-    end)
-  end
+  trigger_wrapper(bufnr, handle, what_trigger)
 end
 
 local function on_insert_leave()
@@ -717,20 +734,31 @@ local function enable_completions(client_id, bufnr, opts)
       group = group,
       buffer = bufnr,
       callback = function()
+        vim.g.completion_menu_shown = nil
         local reason = api.nvim_get_vvar('event').reason --- @type string
         if reason == 'accept' then
           on_complete_done()
         end
       end,
     })
+
+    api.nvim_create_autocmd('TextChangedP', {
+      group = group,
+      buffer = bufnr,
+      callback = function()
+        vim.g.completion_menu_shown = tonumber(vim.fn.pumvisible())
+      end,
+    })
+
     if opts.autotrigger then
-      api.nvim_create_autocmd('InsertCharPre', {
+      api.nvim_create_autocmd('TextChangedI', {
         group = group,
         buffer = bufnr,
-        callback = function()
-          on_insert_char_pre(buf_handles[bufnr])
+        callback = function(args)
+          on_text_changedi(args.buf, buf_handles[bufnr], opts.autotrigger)
         end,
       })
+
       api.nvim_create_autocmd('InsertLeave', {
         group = group,
         buffer = bufnr,
@@ -753,18 +781,9 @@ local function enable_completions(client_id, bufnr, opts)
       'completionProvider',
       'triggerCharacters'
     ) or {}
+
     for _, char in ipairs(triggers) do
-      local clients_for_trigger = buf_handle.triggers[char]
-      if not clients_for_trigger then
-        clients_for_trigger = {}
-        buf_handle.triggers[char] = clients_for_trigger
-      end
-      local client_exists = vim.iter(clients_for_trigger):any(function(c)
-        return c.id == client_id
-      end)
-      if not client_exists then
-        table.insert(clients_for_trigger, client)
-      end
+      vim.opt_local.isexpand:append(vim.fn.escape(char, ',\\'))
     end
   end
 end
@@ -873,7 +892,12 @@ function M._omnifunc(findstart, base)
     return findstart == 1 and -1 or {}
   end
 
-  trigger(bufnr, clients, { triggerKind = protocol.CompletionTriggerKind.Invoked })
+  local _, startcol = unpack(api.nvim_win_get_cursor(0))
+  trigger(
+    bufnr,
+    clients,
+    { triggerKind = protocol.CompletionTriggerKind.Invoked, startcol = startcol }
+  )
 
   -- Return -2 to signal that we should continue completion so that we can
   -- async complete.
