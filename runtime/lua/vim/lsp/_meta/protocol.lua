@@ -2751,6 +2751,8 @@ error('Cannot require a meta file')
 ---The trigger character (a single character) that has trigger code complete.
 ---Is undefined if `triggerKind !== CompletionTriggerKind.TriggerCharacter`
 ---@field triggerCharacter? string
+---
+---@field startcol? integer
 
 ---Additional details for a completion item label.
 ---

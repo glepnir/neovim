@@ -858,6 +858,19 @@ function lsp._set_defaults(client, bufnr)
         vim.lsp.buf.hover()
       end, { buffer = bufnr, desc = 'vim.lsp.buf.hover()' })
     end
+
+    if client:supports_method(ms.textDocument_completion) then
+      --- @type string[]
+      local triggers = vim.tbl_get(
+        client.server_capabilities,
+        'completionProvider',
+        'triggerCharacters'
+      ) or {}
+
+      for _, char in ipairs(triggers) do
+        vim.opt_local.isexpand:append(vim.fn.escape(char, ',\\'))
+      end
+    end
   end)
   if client:supports_method(ms.textDocument_diagnostic) then
     lsp.diagnostic._enable(bufnr)

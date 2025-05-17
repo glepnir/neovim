@@ -1289,4 +1289,163 @@ describe('vim.lsp.completion: integration', function()
       end)
     )
   end)
+
+  it('continues working on subsequent requests', function()
+    local completion_list = {
+      isIncomplete = true,
+      items = {
+        {
+          detail = 'handle_T',
+          filterText = 'handle',
+          insertText = '->handle',
+          insertTextFormat = 1,
+          kind = 5,
+          label = ' handle',
+          score = 0.43193808197975,
+          sortText = '4122d903handle',
+          textEdit = {
+            newText = '->handle',
+            range = {
+              ['end'] = {
+                character = 3,
+                line = 0,
+              },
+              start = {
+                character = 2,
+                line = 0,
+              },
+            },
+          },
+        },
+        {
+          detail = 'int',
+          filterText = 'w_alt_fnum',
+          insertText = '->w_alt_fnum',
+          insertTextFormat = 1,
+          kind = 5,
+          label = ' w_alt_fnum',
+          score = 0.43193808197975,
+          sortText = '4122d903w_alt_fnum',
+          textEdit = {
+            newText = '->w_alt_fnum',
+            range = {
+              ['end'] = {
+                character = 3,
+                line = 0,
+              },
+              start = {
+                character = 2,
+                line = 0,
+              },
+            },
+          },
+        },
+      },
+    }
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert'
+    end)
+    create_server('dummy', completion_list, {
+      forIncomplete = {
+        isIncomplete = false,
+        items = {
+          {
+            detail = 'int',
+            filterText = 'w_arg_idx',
+            insertText = '->w_arg_idx',
+            insertTextFormat = 1,
+            kind = 5,
+            label = ' w_arg_idx',
+            score = 0.43193808197975,
+            sortText = '4122d903w_arg_idx',
+            textEdit = {
+              newText = '->w_arg_idx',
+              range = {
+                ['end'] = {
+                  character = 3,
+                  line = 0,
+                },
+                start = {
+                  character = 2,
+                  line = 0,
+                },
+              },
+            },
+          },
+        },
+      },
+    })
+
+    feed('iwp.<c-x><c-o>')
+    retry(nil, nil, function()
+      eq(
+        1,
+        exec_lua(function()
+          return vim.fn.pumvisible()
+        end)
+      )
+    end)
+
+    feed('w')
+    retry(nil, nil, function()
+      eq(
+        1,
+        exec_lua(function()
+          return vim.fn.pumvisible()
+        end)
+      )
+    end)
+
+    -- accept textEdit
+    feed('<C-y>')
+    eq(
+      { 'wp->w_arg_idx', { 1, 13 } },
+      exec_lua(function()
+        return { vim.api.nvim_get_current_line(), vim.api.nvim_win_get_cursor(0) }
+      end)
+    )
+  end)
+
+  it('accept text.Edit when end_col equals the column at the end of the line.', function()
+    create_server('dummy1', {
+      isIncomplete = false,
+      items = {
+        {
+          detail = 'runtime/lua/vim/treesitter.lua',
+          insertTextFormat = 1,
+          kind = 17,
+          label = 'vim.treesitter',
+          sortText = '0082',
+          textEdit = {
+            newText = 'vim.treesitter',
+            range = {
+              ['end'] = {
+                character = 13,
+                line = 0,
+              },
+              start = {
+                character = 9,
+                line = 0,
+              },
+            },
+          },
+        },
+      },
+    })
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert'
+    end)
+    n.api.nvim_buf_set_lines(0, 0, -1, false, { 'require("vim.")' })
+    feed('A<left><left><C-x><C-O>')
+    retry(nil, nil, function()
+      eq(
+        1,
+        exec_lua(function()
+          return vim.fn.pumvisible()
+        end)
+      )
+    end)
+    feed('<C-Y>')
+    eq('require("vim.treesitter")', exec_lua([[return vim.api.nvim_get_current_line()]]))
+  end)
 end)
