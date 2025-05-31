@@ -671,7 +671,8 @@ void nvim_buf_set_text(uint64_t channel_id, Buffer buffer, Integer start_row, In
                    (int)new_len - 1, (colnr_T)last_item.size, new_byte,
                    kExtmarkUndo);
 
-    changed_lines(buf, (linenr_T)start_row, 0, (linenr_T)end_row + 1, (linenr_T)extra, true);
+    changed_lines(buf, (linenr_T)start_row, (colnr_T)start_col, (linenr_T)end_row + 1,
+                  (linenr_T)extra, true);
 
     FOR_ALL_TAB_WINDOWS(tp, win) {
       if (win->w_buffer == buf) {
