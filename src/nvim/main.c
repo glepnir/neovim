@@ -1624,10 +1624,11 @@ static void read_stdin(void)
   no_wait_return = true;
   bool save_msg_didany = msg_didany;
   buf_T *prev_buf = NULL;
+  buf_T *newbuf = NULL;
 
   if (curbuf->b_ffname) {
     // curbuf is already opened for a file, create a new buffer for stdin. #35269
-    buf_T *newbuf = buflist_new(NULL, NULL, 0, 0);
+    newbuf = buflist_new(NULL, NULL, 0, 0);
     if (newbuf == NULL) {
       semsg("Failed to create buffer for stdin");
       return;
@@ -1640,28 +1641,17 @@ static void read_stdin(void)
 
   set_buflisted(true);
 
-  // Buffer is already initialized by enter_buffer(), just read stdin content
-  if (curbuf->b_ml.ml_mfp == NULL) {
-    // Fallback: buffer not initialized, do full initialization
-    open_buffer(true, NULL, 0);
+  if (newbuf) {
+    readfile(NULL, NULL, 0, 0, (linenr_T)MAXLNUM, NULL, READ_NEW + READ_STDIN, true);
   } else {
-    // Buffer already initialized, just read from stdin
-    readfile(NULL, NULL, 0, 0, (linenr_T)MAXLNUM, NULL,
-             READ_NEW + READ_STDIN, true);
+    open_buffer(true, NULL, 0);
   }
 
   if (buf_is_empty(curbuf)) {
     // stdin was empty so we should wipe it (e.g. "echo file1 | xargs nvim"). #8561
     // stdin buffer may be first or last ("echo foo | nvim file1 -"). #35269
     if ((curbuf->b_next != NULL) || (curbuf->b_prev != NULL)) {
-      if (prev_buf) {
-        buf_T *empty_buf = curbuf;
-        set_curbuf(prev_buf, 0, false);
-        close_buffer(NULL, empty_buf, DOBUF_WIPE, false, false);
-        prev_buf = NULL;
-      } else {
-        do_bufdel(DOBUF_WIPE, NULL, 0, 0, 0, 1);
-      }
+      do_bufdel(DOBUF_WIPE, NULL, 0, 0, 0, 1);
     }
   }
 
