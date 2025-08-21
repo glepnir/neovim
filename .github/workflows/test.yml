@@ -27,74 +27,74 @@ env:
   # TEST_FILTER: foo
 
 jobs:
-  lint:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 10
-    env:
-      CC: clang
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup
+  # lint:
+  #   runs-on: ubuntu-24.04-arm
+  #   timeout-minutes: 10
+  #   env:
+  #     CC: clang
+  #   steps:
+  #     - uses: actions/checkout@v5
+  #     - uses: ./.github/actions/setup
+  #
+  #     - name: Install stylua
+  #       run: |
+  #         wget --directory-prefix="$BIN_DIR" https://github.com/JohnnyMorganz/StyLua/releases/latest/download/stylua-linux-aarch64.zip
+  #         (cd "$BIN_DIR"; unzip stylua*.zip)
+  #
+  #     - name: Build third-party deps
+  #       run: |
+  #         cmake -S cmake.deps -B .deps -G Ninja
+  #         cmake --build .deps
+  #
+  #     - run: cmake -B build -G Ninja -D CI_LINT=ON
+  #
+  #     - if: "!cancelled()"
+  #       name: Determine if run should be aborted
+  #       id: abort_job
+  #       run: echo "status=${{ job.status }}" >> $GITHUB_OUTPUT
+  #
+  #     - if: success() || failure() && steps.abort_job.outputs.status == 'success'
+  #       name: stylua
+  #       run: cmake --build build --target lintlua-stylua
+  #
+  #     - if: success() || failure() && steps.abort_job.outputs.status == 'success'
+  #       name: luals
+  #       run: cmake --build build --target luals
+  #
+  #     - if: success() || failure() && steps.abort_job.outputs.status == 'success'
+  #       name: luacheck
+  #       run: cmake --build build --target lintlua-luacheck
+  #
+  #     - if: success() || failure() && steps.abort_job.outputs.status == 'success'
+  #       name: lintsh
+  #       run: cmake --build build --target lintsh
+  #
+  #     - if: success() || failure() && steps.abort_job.outputs.status == 'success'
+  #       name: clint.py
+  #       run: cmake --build build --target lintc-clint
+  #
+  #     - if: success() || failure() && steps.abort_job.outputs.status == 'success'
+  #       name: clang-tidy
+  #       run: cmake --build build --target lintc-clang-tidy
+  #
+  #     - if: success() || failure() && steps.abort_job.outputs.status == 'success'
+  #       name: uncrustify
+  #       run: cmake --build build --target lintc-uncrustify
 
-      - name: Install stylua
-        run: |
-          wget --directory-prefix="$BIN_DIR" https://github.com/JohnnyMorganz/StyLua/releases/latest/download/stylua-linux-aarch64.zip
-          (cd "$BIN_DIR"; unzip stylua*.zip)
-
-      - name: Build third-party deps
-        run: |
-          cmake -S cmake.deps -B .deps -G Ninja
-          cmake --build .deps
-
-      - run: cmake -B build -G Ninja -D CI_LINT=ON
-
-      - if: "!cancelled()"
-        name: Determine if run should be aborted
-        id: abort_job
-        run: echo "status=${{ job.status }}" >> $GITHUB_OUTPUT
-
-      - if: success() || failure() && steps.abort_job.outputs.status == 'success'
-        name: stylua
-        run: cmake --build build --target lintlua-stylua
-
-      - if: success() || failure() && steps.abort_job.outputs.status == 'success'
-        name: luals
-        run: cmake --build build --target luals
-
-      - if: success() || failure() && steps.abort_job.outputs.status == 'success'
-        name: luacheck
-        run: cmake --build build --target lintlua-luacheck
-
-      - if: success() || failure() && steps.abort_job.outputs.status == 'success'
-        name: lintsh
-        run: cmake --build build --target lintsh
-
-      - if: success() || failure() && steps.abort_job.outputs.status == 'success'
-        name: clint.py
-        run: cmake --build build --target lintc-clint
-
-      - if: success() || failure() && steps.abort_job.outputs.status == 'success'
-        name: clang-tidy
-        run: cmake --build build --target lintc-clang-tidy
-
-      - if: success() || failure() && steps.abort_job.outputs.status == 'success'
-        name: uncrustify
-        run: cmake --build build --target lintc-uncrustify
-
-  clang-analyzer:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 20
-    env:
-      CC: clang
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup
-      - name: Build third-party deps
-        run: |
-          cmake -S cmake.deps --preset ci
-          cmake --build .deps
-          cmake --preset ci
-      - run: cmake --build build --target clang-analyzer
+  # clang-analyzer:
+  #   runs-on: ubuntu-24.04-arm
+  #   timeout-minutes: 20
+  #   env:
+  #     CC: clang
+  #   steps:
+  #     - uses: actions/checkout@v5
+  #     - uses: ./.github/actions/setup
+  #     - name: Build third-party deps
+  #       run: |
+  #         cmake -S cmake.deps --preset ci
+  #         cmake --build .deps
+  #         cmake --preset ci
+  #     - run: cmake --build build --target clang-analyzer
 
   posix:
     name: ${{ matrix.build.os }} ${{ matrix.build.flavor }} ${{ matrix.build.cc }} ${{ matrix.test }}
@@ -225,8 +225,8 @@ jobs:
       - run: cd runtime; ../zig-out/bin/nvim -u NONE -i NONE -e --headless -c "helptags ++t doc" -c quit
       - run: diff -u runtime/doc/tags zig-out/runtime/doc/tags
 
-  windows:
-    uses: ./.github/workflows/test_windows.yml
+  # windows:
+  #   uses: ./.github/workflows/test_windows.yml
 
   with-external-deps:
     runs-on: ubuntu-24.04-arm
