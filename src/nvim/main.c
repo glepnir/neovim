@@ -1645,7 +1645,14 @@ static void read_stdin(void)
     // stdin was empty so we should wipe it (e.g. "echo file1 | xargs nvim"). #8561
     // stdin buffer may be first or last ("echo foo | nvim file1 -"). #35269
     if ((curbuf->b_next != NULL) || (curbuf->b_prev != NULL)) {
-      do_bufdel(DOBUF_WIPE, NULL, 0, 0, 0, 1);
+      if (prev_buf) {
+        buf_T *empty_buf = curbuf;
+        set_curbuf(prev_buf, 0, false);
+        wipe_buffer(empty_buf, false);
+        prev_buf = NULL;
+      } else {
+        do_bufdel(DOBUF_WIPE, NULL, 0, 0, 0, 1);
+      }
     }
   }
 
