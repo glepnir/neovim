@@ -1639,8 +1639,17 @@ static void read_stdin(void)
   }
 
   set_buflisted(true);
-  // Create memfile and read from stdin.
-  open_buffer(true, NULL, 0);
+
+  // Buffer is already initialized by enter_buffer(), just read stdin content
+  if (curbuf->b_ml.ml_mfp == NULL) {
+    // Fallback: buffer not initialized, do full initialization
+    open_buffer(true, NULL, 0);
+  } else {
+    // Buffer already initialized, just read from stdin
+    readfile(NULL, NULL, 0, 0, (linenr_T)MAXLNUM, NULL,
+             READ_NEW + READ_STDIN, true);
+  }
+
   if (buf_is_empty(curbuf)) {
     // stdin was empty so we should wipe it (e.g. "echo file1 | xargs nvim"). #8561
     // stdin buffer may be first or last ("echo foo | nvim file1 -"). #35269
@@ -1648,7 +1657,7 @@ static void read_stdin(void)
       if (prev_buf) {
         buf_T *empty_buf = curbuf;
         set_curbuf(prev_buf, 0, false);
-        wipe_buffer(empty_buf, false);
+        close_buffer(NULL, empty_buf, DOBUF_WIPE, false, false);
         prev_buf = NULL;
       } else {
         do_bufdel(DOBUF_WIPE, NULL, 0, 0, 0, 1);
