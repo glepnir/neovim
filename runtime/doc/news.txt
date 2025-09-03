@@ -21,6 +21,8 @@ cycle (Nvim HEAD, the "master" branch).
 EVENTS
 
 • Renamed "nvim.find_exrc" |default-autocmds| group to "nvim.exrc".
+• |BufModifiedSet| has been removed. Use the |OptionSet| event with pattern
+  "modified" instead.
 
 EXPERIMENTS
 
