@@ -31,6 +31,7 @@
 #include "nvim/syntax.h"
 #include "nvim/types_defs.h"
 #include "nvim/ui.h"
+#include "nvim/ui_compositor.h"
 #include "nvim/ui_defs.h"
 #include "nvim/vim_defs.h"
 #include "nvim/window.h"
@@ -380,6 +381,24 @@ static int win_split_flags(WinSplit split, bool toplevel)
   return flags;
 }
 
+static bool can_move(win_T *wp, bool switch_tab, Error *err)
+{
+  if (is_aucmd_win(wp) && switch_tab) {
+    api_set_error(err, kErrorTypeException, "Cannot move autocmd window to another tabpage");
+    return false;
+  }
+  // Can't move the cmdwin or its old curwin to a different tabpage.
+  if ((wp == cmdwin_win || wp == cmdwin_old_curwin) && switch_tab) {
+    api_set_error(err, kErrorTypeException, "%s", e_cmdwin);
+    return false;
+  }
+  if (wp->w_floating && wp->w_config.external) {
+    api_set_error(err, kErrorTypeException, "%s", "can not move external floating window");
+    return false;
+  }
+  return true;
+}
+
 /// Configures window layout. Cannot be used to move the last window in a
 /// tabpage to a different one.
 ///
@@ -416,36 +435,34 @@ void nvim_win_set_config(Window window, Dict(win_config) *config, Error *err)
     return;
   }
 
+  win_T *parent = NULL;
+  tabpage_T *parent_tp = NULL;
+  if (config->win == 0) {
+    parent = curwin;
+    parent_tp = curtab;
+  } else if (config->win > 0) {
+    parent = find_window_by_handle(fconfig.window, err);
+    if (!parent) {
+      return;
+    }
+    parent_tp = win_find_tabpage(parent);
+    if (!parent_tp) {
+      return;
+    }
+  }
+
   if (was_split && !to_split) {
     if (!win_new_float(win, false, fconfig, err)) {
       return;
     }
     redraw_later(win, UPD_NOT_VALID);
   } else if (to_split) {
-    win_T *parent = NULL;
-    tabpage_T *parent_tp = NULL;
-    if (config->win == 0) {
-      parent = curwin;
-      parent_tp = curtab;
-    } else if (config->win > 0) {
-      parent = find_window_by_handle(fconfig.window, err);
-      if (!parent) {
-        return;
-      }
-      parent_tp = win_find_tabpage(parent);
-    }
     if (parent) {
       if (parent->w_floating) {
         api_set_error(err, kErrorTypeException, "Cannot split a floating window");
         return;
       }
-      if (is_aucmd_win(win) && win_tp != parent_tp) {
-        api_set_error(err, kErrorTypeException, "Cannot move autocmd window to another tabpage");
-        return;
-      }
-      // Can't move the cmdwin or its old curwin to a different tabpage.
-      if ((win == cmdwin_win || win == cmdwin_old_curwin) && win_tp != parent_tp) {
-        api_set_error(err, kErrorTypeException, "%s", e_cmdwin);
+      if (!can_move(win, win_tp != parent_tp, err)) {
         return;
       }
     }
@@ -632,6 +649,48 @@ restore_curwin:
       win_setheight_win(fconfig.height, win);
     }
   } else {
+    if (win->w_floating && parent && parent_tp != win_tp) {
+      if (!can_move(win, win_tp != parent_tp, err)) {
+        return;
+      }
+
+      if (win == curwin) {
+        win_goto(win_float_find_altwin(win, NULL));
+        if (curwin == win) {
+          api_set_error(err, kErrorTypeException, "Failed to switch away from window %d", win->handle);
+          return;
+        }
+      }
+      win_remove(win, win_tp == curtab ? NULL : win_tp);
+
+      // Find insertion point in target tabpage
+      win_T *target_after;
+      if (parent_tp == curtab) {
+        target_after = lastwin_nofloating();
+      } else {
+        target_after = parent_tp->tp_lastwin;
+        while (target_after && target_after->w_floating && target_after->w_prev) {
+          target_after = target_after->w_prev;
+        }
+      }
+
+      // Insert into target tabpage
+      win_append(target_after, win, parent_tp == curtab ? NULL : parent_tp);
+      win_tp = parent_tp;
+      // Ensure target tabpage has valid curwin
+      if (parent_tp != curtab && parent_tp->tp_curwin == NULL) {
+        parent_tp->tp_curwin = parent_tp->tp_firstwin;
+      }
+
+      if (parent_tp != curtab) {
+        if (ui_has(kUIMultigrid)) {
+          ui_call_win_hide(win->w_grid_alloc.handle);
+        }
+        ui_comp_remove_grid(&win->w_grid_alloc);
+      } else {
+        win->w_hl_needs_update = true;
+      }
+    }
     win_config_float(win, fconfig);
     win->w_pos_changed = true;
   }
