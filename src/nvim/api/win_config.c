@@ -31,6 +31,7 @@
 #include "nvim/syntax.h"
 #include "nvim/types_defs.h"
 #include "nvim/ui.h"
+#include "nvim/ui_compositor.h"
 #include "nvim/ui_defs.h"
 #include "nvim/vim_defs.h"
 #include "nvim/window.h"
@@ -634,6 +635,78 @@ restore_curwin:
       win_setheight_win(fconfig.height, win);
     }
   } else {
+   if (win->w_floating && fconfig.relative == kFloatRelativeWindow && parent != NULL) {
+      tabpage_T *parent_tp = win_find_tabpage(parent);
+      if (parent_tp != win_tp && parent_tp != NULL) {
+        // Moving floating window to different tabpage
+        // Check cmdwin restrictions
+        if (win == cmdwin_win || win == cmdwin_old_curwin) {
+          api_set_error(err, kErrorTypeException, "%s", e_cmdwin);
+          return;
+        }
+
+        // Handle current window transition
+        bool was_curwin = (win == curwin);
+        if (was_curwin) {
+          // Find alternative window before moving
+          win_T *alt_win = win_float_find_altwin(win, win_tp == curtab ? NULL : win_tp);
+          if (alt_win && win_valid_any_tab(alt_win)) {
+            if (win_tp == curtab) {
+              win_enter(alt_win, false);
+            } else {
+              win_tp->tp_curwin = alt_win;
+            }
+          }
+        }
+        
+        // Remove from current tabpage
+        win_remove(win, win_tp == curtab ? NULL : win_tp);
+        
+        // Find insertion point in target tabpage
+        win_T *target_after;
+        if (parent_tp == curtab) {
+          target_after = lastwin_nofloating();
+        } else {
+          target_after = parent_tp->tp_lastwin;
+          while (target_after && target_after->w_floating && target_after->w_prev) {
+            target_after = target_after->w_prev;
+          }
+        }
+        
+        // Insert into target tabpage
+        win_append(target_after, win, parent_tp == curtab ? NULL : parent_tp);
+        
+        // Handle external floating windows
+        if (win->w_config.external) {
+          FOR_ALL_TABS(tp) {
+            if (tp != parent_tp && tp->tp_curwin == win) {
+              tp->tp_curwin = tp->tp_firstwin;
+            }
+          }
+        }
+        // Update for rest of function
+        win_tp = parent_tp;
+        // Ensure target tabpage has valid curwin
+        if (parent_tp != curtab && parent_tp->tp_curwin == NULL) {
+          parent_tp->tp_curwin = parent_tp->tp_firstwin;
+        }
+
+        // Handle UI visibility and redrawing
+        if (parent_tp != curtab) {
+          // Moving to different tabpage - hide the window
+          if (ui_has(kUIMultigrid)) {
+            ui_call_win_hide(win->w_grid_alloc.handle);
+          } else {
+            ui_comp_remove_grid(&win->w_grid_alloc);
+          }
+        } else {
+          // Moving to current tabpage - ensure proper display
+          win->w_hl_needs_update = true;
+          redraw_later(win, UPD_NOT_VALID);
+        }
+        win->w_pos_changed = true;
+      }
+    }
     win_config_float(win, fconfig);
     win->w_pos_changed = true;
   }
