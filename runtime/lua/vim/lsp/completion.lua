@@ -56,6 +56,7 @@ local ns_to_ms = 0.000001
 --- @field clients table<integer, vim.lsp.Client>
 --- @field triggers table<string, vim.lsp.Client[]>
 --- @field convert? fun(item: lsp.CompletionItem): table
+--- @field preselect? boolean
 
 --- @type table<integer, vim.lsp.completion.BufHandle>
 local buf_handles = {}
@@ -280,9 +281,11 @@ end
 --- @param result vim.lsp.CompletionResult Result of `textDocument/completion`
 --- @param prefix string prefix to filter the completion items
 --- @param client_id integer? Client ID
---- @return table[]
+--- @param handle_preselect boolean
+---
+--- @return table[], table?
 --- @see complete-items
-function M._lsp_to_complete_items(result, prefix, client_id)
+function M._lsp_to_complete_items(result, prefix, client_id, handle_preselect)
   local items = get_items(result)
   if vim.tbl_isempty(items) then
     return {}
@@ -313,6 +316,8 @@ function M._lsp_to_complete_items(result, prefix, client_id)
   local candidates = {}
   local bufnr = api.nvim_get_current_buf()
   local user_convert = vim.tbl_get(buf_handles, bufnr, 'convert')
+  local preselect_item
+  local preselect = buf_handles[bufnr].preselect
   for _, item in ipairs(items) do
     if matches(item) then
       local word = get_completion_word(item, prefix, match_item_by_value)
@@ -345,7 +350,11 @@ function M._lsp_to_complete_items(result, prefix, client_id)
       if user_convert then
         completion_item = vim.tbl_extend('keep', user_convert(item), completion_item)
       end
-      table.insert(candidates, completion_item)
+      if preselect and handle_preselect and item.preselect then
+        preselect_item = item
+      else
+        table.insert(candidates, completion_item)
+      end
     end
   end
   ---@diagnostic disable-next-line: no-unknown
@@ -357,7 +366,7 @@ function M._lsp_to_complete_items(result, prefix, client_id)
     return (itema.sortText or itema.label) < (itemb.sortText or itemb.label)
   end)
 
-  return candidates
+  return candidates, preselect_item
 end
 
 --- @param lnum integer 0-indexed
@@ -390,8 +399,11 @@ end
 --- @param server_start_boundary? integer 0-indexed word boundary, based on textEdit.range.start.character
 --- @param result vim.lsp.CompletionResult
 --- @param encoding 'utf-8'|'utf-16'|'utf-32'
+--- @param handle_preselect boolean
+---
 --- @return table[] matches
 --- @return integer? server_start_boundary
+--- @return table? preselect completion item
 function M._convert_results(
   line,
   lnum,
@@ -400,7 +412,8 @@ function M._convert_results(
   client_start_boundary,
   server_start_boundary,
   result,
-  encoding
+  encoding,
+  handle_preselect
 )
   -- Completion response items may be relative to a position different than `client_start_boundary`.
   -- Concrete example, with lua-language-server:
@@ -425,8 +438,9 @@ function M._convert_results(
     server_start_boundary = client_start_boundary
   end
   local prefix = line:sub((server_start_boundary or client_start_boundary) + 1, cursor_col)
-  local matches = M._lsp_to_complete_items(result, prefix, client_id)
-  return matches, server_start_boundary
+  local matches, preselect_item =
+    M._lsp_to_complete_items(result, prefix, client_id, handle_preselect)
+  return matches, server_start_boundary, preselect_item
 end
 
 -- NOTE: The reason we don't use `lsp.buf_request_all` here is because we want to filter the clients
@@ -507,6 +521,8 @@ local function trigger(bufnr, clients, ctx)
     local matches = {}
 
     local server_start_boundary --- @type integer?
+    -- only save first preselect item
+    local preselect_item
     for client_id, response in pairs(responses) do
       local client = lsp.get_client_by_id(client_id)
       if response.err then
@@ -522,8 +538,8 @@ local function trigger(bufnr, clients, ctx)
       if result then
         Context.isIncomplete = Context.isIncomplete or result.isIncomplete
         local encoding = client and client.offset_encoding or 'utf-16'
-        local client_matches
-        client_matches, server_start_boundary = M._convert_results(
+        local client_matches, client_preselect_item
+        client_matches, server_start_boundary, client_preselect_item = M._convert_results(
           line,
           cursor_row - 1,
           cursor_col,
@@ -531,8 +547,13 @@ local function trigger(bufnr, clients, ctx)
           word_boundary,
           nil,
           result,
-          encoding
+          encoding,
+          preselect_item ~= nil
         )
+
+        if not preselect_item then
+          preselect_item = client_preselect_item
+        end
 
         vim.list_extend(matches, client_matches)
       end
@@ -551,6 +572,7 @@ local function trigger(bufnr, clients, ctx)
     end, prev_matches)
 
     matches = vim.list_extend(prev_matches, matches)
+    table.insert(matches, 1, preselect_item)
 
     local start_col = (server_start_boundary or word_boundary) + 1
     Context.cursor = { cursor_row, start_col }
@@ -711,6 +733,7 @@ end
 --- @inlinedoc
 --- @class vim.lsp.completion.BufferOpts
 --- @field autotrigger? boolean  (default: false) When true, completion triggers automatically based on the server's `triggerCharacters`.
+--- @field preselect? boolean
 --- @field convert? fun(item: lsp.CompletionItem): table Transforms an LSP CompletionItem to |complete-items|.
 
 ---@param client_id integer
@@ -719,7 +742,7 @@ end
 local function enable_completions(client_id, bufnr, opts)
   local buf_handle = buf_handles[bufnr]
   if not buf_handle then
-    buf_handle = { clients = {}, triggers = {}, convert = opts.convert }
+    buf_handle = { clients = {}, triggers = {}, convert = opts.convert, preselect = opts.preselect }
     buf_handles[bufnr] = buf_handle
 
     -- Attach to buffer events.
