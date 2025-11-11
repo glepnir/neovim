@@ -1361,6 +1361,7 @@ describe('float window', function()
         width = 20,
         zindex = 60,
         hide = false,
+        statusline = false,
       }
       eq(expected, api.nvim_win_get_config(win))
       eq(
@@ -1380,17 +1381,31 @@ describe('float window', function()
         )
       )
 
-      eq(
-        { external = false, focusable = true, mouse = true, hide = false, relative = '', split = 'left', width = 40, height = 6 },
-        api.nvim_win_get_config(0)
-      )
+      eq({
+        external = false,
+        focusable = true,
+        mouse = true,
+        hide = false,
+        relative = '',
+        split = 'left',
+        width = 40,
+        height = 6,
+        statusline = false,
+      }, api.nvim_win_get_config(0))
 
       if multigrid then
         api.nvim_win_set_config(win, { external = true, width = 10, height = 1 })
-        eq(
-          { external = true, focusable = true, mouse = true, width = 10, height = 1, relative = '', hide = false, border = 'none' },
-          api.nvim_win_get_config(win)
-        )
+        eq({
+          external = true,
+          focusable = true,
+          mouse = true,
+          width = 10,
+          height = 1,
+          relative = '',
+          hide = false,
+          border = 'none',
+          statusline = false,
+        }, api.nvim_win_get_config(win))
       end
     end)
 
@@ -4466,6 +4481,7 @@ describe('float window', function()
         focusable = true,
         mouse = true,
         zindex = 50,
+        statusline = false,
       }, api.nvim_win_get_config(win))
 
       feed('<c-e>')

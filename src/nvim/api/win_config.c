@@ -204,6 +204,8 @@
 ///   - split: Split direction: "left", "right", "above", "below".
 ///   - _cmdline_offset: (EXPERIMENTAL) When provided, anchor the |cmdline-completion|
 ///     popupmenu to this window, with an offset in screen cell width.
+///   - statusline: If true, render statusline on floating window.
+///     Only takes effect when 'laststatus' is not 0.
 ///
 /// @param[out] err Error details, if any
 ///
@@ -740,6 +742,7 @@ Dict(win_config) nvim_win_get_config(Window window, Arena *arena, Error *err)
   PUT_KEY_X(rv, external, config->external);
   PUT_KEY_X(rv, hide, config->hide);
   PUT_KEY_X(rv, mouse, config->mouse);
+  PUT_KEY_X(rv, statusline, config->statusline);
 
   if (wp->w_floating) {
     PUT_KEY_X(rv, width, config->width);
@@ -1399,6 +1402,14 @@ static bool parse_win_config(win_T *wp, Dict(win_config) *config, WinConfig *fco
     fconfig->_cmdline_offset = (int)config->_cmdline_offset;
   }
 
+  if (HAS_KEY_X(config, statusline)) {
+    if (config->statusline && config->height == 1) {
+      api_set_error(err, kErrorTypeValidation,
+                    "'height' must be greater than 1 when 'statusline' is set");
+      goto fail;
+    }
+    fconfig->statusline = config->statusline;
+  }
   return true;
 
 fail:

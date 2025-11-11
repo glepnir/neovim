@@ -870,3 +870,123 @@ describe('default statusline', function()
     ]])
   end)
 end)
+
+describe('float statusline', function()
+  local screen
+  before_each(function()
+    clear()
+    screen = Screen.new(30, 20)
+    screen:add_extra_attr_ids({
+      [101] = { foreground = Screen.colors.Magenta1, bold = true },
+      [102] = {
+        foreground = Screen.colors.Magenta1,
+        underline = true,
+        background = Screen.colors.LightGray,
+        bold = true,
+      },
+    })
+    command('set laststatus=2')
+  end)
+
+  it('"statusline" field works', function()
+    local buf = api.nvim_create_buf(false, false)
+    api.nvim_buf_set_lines(buf, 0, -1, false, { '1', '2', '3', '4' })
+    local cfg = {
+      relative = 'editor',
+      row = 1,
+      col = 1,
+      height = 4,
+      width = 10,
+      statusline = true,
+      border = 'single',
+    }
+    local win = api.nvim_open_win(buf, false, cfg)
+    local first_screen = [[
+      ^                              |
+      {1:~}┌──────────┐{1:                 }|
+      {1:~}│{4:1         }│{1:                 }|
+      {1:~}│{4:2         }│{1:                 }|
+      {1:~}│{4:3         }│{1:                 }|
+      {1:~}│{2:<ame] [+] }│{1:                 }|
+      {1:~}└──────────┘{1:                 }|
+      {1:~                             }|*11
+      {3:[No Name]                     }|
+                                    |
+    ]]
+    screen:expect(first_screen)
+
+    eq(true, api.nvim_win_get_config(win).statusline)
+
+    -- remove by set laststatus option
+    command('set laststatus=0')
+    local without_stl = [[
+      ^                              |
+      {1:~}┌──────────┐{1:                 }|
+      {1:~}│{4:1         }│{1:                 }|
+      {1:~}│{4:2         }│{1:                 }|
+      {1:~}│{4:3         }│{1:                 }|
+      {1:~}│{4:4         }│{1:                 }|
+      {1:~}└──────────┘{1:                 }|
+      {1:~                             }|*12
+                                    |
+    ]]
+    screen:expect(without_stl)
+
+    command('set laststatus=2')
+    screen:expect(first_screen)
+
+    -- Statusline disappears when entering a tabpage after setting 'laststatus'
+    command('tabnew')
+    cfg.border = 'rounded'
+    local win2 = api.nvim_open_win(buf, false, cfg)
+    local tab2 = api.nvim_get_current_tabpage()
+    command('set laststatus=0 | tabfirst')
+    screen:expect([[
+      {5: }{101:2}{5:+ [No Name] }{24: }{102:2}{24:+ [No Name] }{2: }{24:X}|
+      ^ ┌──────────┐                 |
+      {1:~}│{4:1         }│{1:                 }|
+      {1:~}│{4:2         }│{1:                 }|
+      {1:~}│{4:3         }│{1:                 }|
+      {1:~}│{4:4         }│{1:                 }|
+      {1:~}└──────────┘{1:                 }|
+      {1:~                             }|*12
+                                    |
+    ]])
+    api.nvim_win_close(win2, true)
+    command('tabclose ' .. tab2)
+
+    -- toggle Statusline by using api
+    cfg.statusline = false
+    cfg.border = 'single'
+    api.nvim_win_set_config(win, cfg)
+    screen:expect(without_stl)
+
+    cfg.statusline = true
+    command('set laststatus=2')
+    api.nvim_win_set_config(win, cfg)
+    screen:expect(first_screen)
+
+    command('set ruler')
+    cfg.width = 28
+    api.nvim_win_set_config(win, cfg)
+    api.nvim_buf_set_name(buf, 'fstl')
+    screen:expect([[
+      ^                              |
+      ┌────────────────────────────┐|
+      │{4:1                           }│|
+      │{4:2                           }│|
+      │{4:3                           }│|
+      │{2:fstl [+]  1,1            Top}│|
+      └────────────────────────────┘|
+      {1:~                             }|*11
+      {3:[No Name]   0,0-1          All}|
+                                    |
+    ]])
+
+    cfg.height = 1
+    eq(
+      "'height' must be greater than 1 when 'statusline' is set",
+      pcall_err(api.nvim_win_set_config, win, cfg)
+    )
+  end)
+end)

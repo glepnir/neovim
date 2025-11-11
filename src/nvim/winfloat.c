@@ -104,7 +104,7 @@ win_T *win_new_float(win_T *wp, bool last, WinConfig fconfig, Error *err)
     win_append(lastwin_nofloating(), wp, NULL);
   }
   wp->w_floating = true;
-  wp->w_status_height = 0;
+  wp->w_status_height = fconfig.statusline && p_ls != 0;
   wp->w_winbar_height = 0;
   wp->w_hsep_height = 0;
   wp->w_vsep_width = 0;
@@ -207,6 +207,11 @@ void win_config_float(win_T *wp, WinConfig fconfig)
                                   wp->w_config.border_hl_ids,
                                   sizeof fconfig.border_hl_ids) != 0);
 
+  if (wp->w_status_height && (!fconfig.statusline || p_ls != 2)) {
+    win_remove_status_line(wp, false);
+  } else if (fconfig.statusline && wp->w_status_height == 0 && p_ls != 0) {
+    wp->w_status_height = STATUS_HEIGHT;
+  }
   merge_win_config(&wp->w_config, fconfig);
 
   bool has_border = wp->w_floating && wp->w_config.border;
@@ -225,7 +230,7 @@ void win_config_float(win_T *wp, WinConfig fconfig)
 
   win_set_inner_size(wp, true);
   set_must_redraw(UPD_VALID);
-
+  wp->w_redr_status = wp->w_status_height;
   wp->w_pos_changed = true;
   if (change_external || change_border) {
     wp->w_hl_needs_update = true;
@@ -304,6 +309,20 @@ void win_check_anchored_floats(win_T *win)
     if (wp->w_config.relative == kFloatRelativeWindow
         && wp->w_config.window == win->handle) {
       wp->w_pos_changed = true;
+    }
+  }
+}
+
+void win_float_update_statusline(void)
+{
+  bool should_show = p_ls != 0;
+  for (win_T *wp = lastwin; wp && wp->w_floating; wp = wp->w_prev) {
+    bool has_status = wp->w_status_height > 0;
+    if (should_show && !has_status && wp->w_config.statusline) {
+      wp->w_status_height = STATUS_HEIGHT;
+      win_config_float(wp, wp->w_config);
+    } else if (!should_show && has_status) {
+      win_config_float(wp, wp->w_config);
     }
   }
 }
