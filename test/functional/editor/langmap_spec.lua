@@ -4,7 +4,6 @@ local n = require('test.functional.testnvim')()
 local eq, neq, call = t.eq, t.neq, n.call
 local eval, feed, clear = n.eval, n.feed, n.clear
 local command, insert, expect = n.command, n.insert, n.expect
-local feed_command = n.feed_command
 local curwin = n.api.nvim_get_current_win
 
 describe("'langmap'", function()
@@ -99,7 +98,7 @@ describe("'langmap'", function()
     it(':s///c confirmation', function()
       command('set langmap=yn,ny')
       feed('qa')
-      feed_command('s/i/w/gc')
+      feed(':s/i/w/gc<CR>')
       feed('yynq')
       expect('wwi www')
       feed('u@a')
@@ -159,7 +158,7 @@ describe("'langmap'", function()
       some
       lines
       ]])
-      feed_command('4,2d')
+      feed(':4,2d<CR>')
       feed('n')
       expect([[
       hello
@@ -185,7 +184,7 @@ describe("'langmap'", function()
       feed('x1<CR>')
       eq(1, eval('gotten_one'))
       command('let g:gotten_one = 0')
-      feed_command('call Map()')
+      feed(':call Map()<CR>')
       feed('1<CR>')
       eq(1, eval('gotten_one'))
     end)

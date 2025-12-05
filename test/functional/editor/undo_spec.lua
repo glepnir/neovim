@@ -7,7 +7,6 @@ local eval = n.eval
 local expect = n.expect
 local eq = t.eq
 local feed = n.feed
-local feed_command = n.feed_command
 local insert = n.insert
 local fn = n.fn
 local exec = n.exec
@@ -16,6 +15,10 @@ local exec_lua = n.exec_lua
 local function lastmessage()
   local messages = fn.split(fn.execute('messages'), '\n')
   return messages[#messages]
+end
+
+local feed_undo = function(level)
+  feed((':undo! %s<CR>'):format(level or ''))
 end
 
 describe('u CTRL-R g- g+', function()
@@ -172,7 +175,7 @@ describe(':undo! command', function()
     feed('o99 little bugs in the code<Esc>')
   end)
   it('works', function()
-    feed_command('undo!')
+    feed_undo()
     expect([[
       1 little bug in the code
       1 little bug in the code
@@ -181,7 +184,7 @@ describe(':undo! command', function()
     eq('Already at newest change', lastmessage())
   end)
   it('works with arguments', function()
-    feed_command('undo! 2')
+    feed_undo('2')
     expect([[
       1 little bug in the code
       1 little bug in the code]])
@@ -190,7 +193,7 @@ describe(':undo! command', function()
   end)
   it('correctly sets alternative redo', function()
     feed('uo101 little bugs in the code<Esc>')
-    feed_command('undo!')
+    feed_undo()
     feed('<C-r>')
     expect([[
       1 little bug in the code
@@ -200,7 +203,7 @@ describe(':undo! command', function()
 
     feed('uuoTake 2 down, patch them around<Esc>')
     feed('o101 little bugs in the code<Esc>')
-    feed_command('undo! 2')
+    feed_undo('2')
     feed('<C-r><C-r>')
     expect([[
       1 little bug in the code
@@ -209,14 +212,14 @@ describe(':undo! command', function()
       99 little bugs in the code]])
   end)
   it('fails when attempting to redo or move to different undo branch', function()
-    feed_command('undo! 4')
+    feed_undo('4')
     eq('E5767: Cannot use :undo! to redo or move to a different undo branch', eval('v:errmsg'))
     feed('u')
-    feed_command('undo! 4')
+    feed_undo('4')
     eq('E5767: Cannot use :undo! to redo or move to a different undo branch', eval('v:errmsg'))
     feed('o101 little bugs in the code<Esc>')
     feed('o101 little bugs in the code<Esc>')
-    feed_command('undo! 4')
+    feed_undo('4')
     eq('E5767: Cannot use :undo! to redo or move to a different undo branch', eval('v:errmsg'))
   end)
 end)

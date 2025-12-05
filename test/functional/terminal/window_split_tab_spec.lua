@@ -5,7 +5,6 @@ local tt = require('test.functional.testterm')
 local assert_alive = n.assert_alive
 local clear = n.clear
 local feed = n.feed
-local feed_command = n.feed_command
 local command = n.command
 local eq = t.eq
 local eval = n.eval
@@ -42,7 +41,7 @@ describe(':terminal', function()
   it('does not change size on WinEnter', function()
     feed('<c-\\><c-n>')
     feed('k')
-    feed_command('2split')
+    feed(':2split<CR>')
     screen:expect([[
       ^tty ready                                         |
       rows: 5, cols: 50                                 |
@@ -54,7 +53,7 @@ describe(':terminal', function()
       ==========                                        |
       :2split                                           |
     ]])
-    feed_command('wincmd p')
+    feed(':wincmd p<CR>')
     screen:expect([[
       tty ready                                         |
       rows: 5, cols: 50                                 |

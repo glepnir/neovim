@@ -6,8 +6,6 @@ local tt = require('test.functional.testterm')
 local clear = n.clear
 local eq = t.eq
 local eval = n.eval
-local exc_exec = n.exc_exec
-local feed_command = n.feed_command
 local feed = n.feed
 local insert = n.insert
 local neq = t.neq
@@ -300,7 +298,7 @@ describe('jobs', function()
 
   it('returns 0 when it fails to start', function()
     eq('', eval('v:errmsg'))
-    feed_command('let g:test_jobid = jobstart([])')
+    feed(':let g:test_jobid = jobstart([])<CR>')
     eq(0, eval('g:test_jobid'))
     eq('E474:', string.match(eval('v:errmsg'), 'E%d*:'))
   end)
@@ -860,12 +858,12 @@ describe('jobs', function()
     end)
 
     it('will return -2 when interrupted without timeout', function()
-      feed_command(
-        'call rpcnotify(g:channel, "ready") | '
+      feed(
+        ':call rpcnotify(g:channel, "ready") | '
           .. 'call rpcnotify(g:channel, "wait", '
           .. 'jobwait([jobstart("'
           .. (is_os('win') and 'Start-Sleep 10' or 'sleep 10')
-          .. '; exit 55")]))'
+          .. '; exit 55")]))<CR>'
       )
       eq({ 'notification', 'ready', {} }, next_msg())
       feed('<c-c>')
@@ -873,12 +871,12 @@ describe('jobs', function()
     end)
 
     it('will return -2 when interrupted with timeout', function()
-      feed_command(
-        'call rpcnotify(g:channel, "ready") | '
+      feed(
+        ':call rpcnotify(g:channel, "ready") | '
           .. 'call rpcnotify(g:channel, "wait", '
           .. 'jobwait([jobstart("'
           .. (is_os('win') and 'Start-Sleep 10' or 'sleep 10')
-          .. '; exit 55")], 10000))'
+          .. '; exit 55")], 10000))<CR>'
       )
       eq({ 'notification', 'ready', {} }, next_msg())
       feed('<c-c>')
@@ -921,7 +919,7 @@ describe('jobs', function()
         \ ])
       endfunction
       ]])
-      feed_command('call Run()')
+      command('call Run()')
       local r
       for i = 10, 1, -1 do
         r = next_msg()
@@ -1012,7 +1010,7 @@ describe('jobs', function()
           echon "\nccc"
         endfunc
       ]])
-      feed_command('call PrintAndPoll()')
+      feed(':call PrintAndPoll()<CR>')
       screen:expect([[
                                                           |
         {3:                                                  }|
@@ -1064,7 +1062,7 @@ describe('jobs', function()
     ]])
     -- The crash only triggered if both jobs are cleaned up on the same event
     -- loop tick. This is also prevented by try-block, so feed must be used.
-    feed_command('call DoIt()')
+    feed(':call DoIt()<CR>')
     feed('<cr>') -- press RETURN
     assert_alive()
   end)
@@ -1243,8 +1241,7 @@ describe('jobs', function()
       -- Can't wait for the next message in case this test fails, if it fails
       -- there won't be any more messages, and the test would hang.
       vim.uv.sleep(100)
-      local err = exc_exec('call jobpid(j)')
-      eq('Vim(call):E900: Invalid channel id', err)
+      eq('Vim:E900: Invalid channel id', pcall_err(eval, 'jobpid(j)'))
 
       -- cleanup
       eq(other_pid, eval('jobpid(' .. other_jobid .. ')'))

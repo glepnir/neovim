@@ -6,12 +6,11 @@ local Screen = require('test.functional.ui.screen')
 
 local assert_alive = n.assert_alive
 local testprg = n.testprg
-local eq, call, clear, eval, feed_command, feed, api =
-  t.eq, n.call, n.clear, n.eval, n.feed_command, n.feed, n.api
+local eq, call, clear, eval, feed, api =
+  t.eq, n.call, n.clear, n.eval, n.feed, n.api
 local command = n.command
 local insert = n.insert
 local expect = n.expect
-local exc_exec = n.exc_exec
 local pcall_err = t.pcall_err
 local is_os = t.is_os
 
@@ -43,10 +42,10 @@ describe('system()', function()
     it('parameter validation does NOT modify v:shell_error', function()
       -- 1. Call system() with invalid parameters.
       -- 2. Assert that v:shell_error was NOT set.
-      feed_command('call system({})')
+      feed(':call system({})<CR>')
       eq('E475: Invalid argument: expected String or List', eval('v:errmsg'))
       eq(0, eval('v:shell_error'))
-      feed_command('call system([])')
+      feed(':call system([])<CR>')
       eq('E474: Invalid argument', eval('v:errmsg'))
       eq(0, eval('v:shell_error'))
 
@@ -60,9 +59,9 @@ describe('system()', function()
 
       -- 1. Call system() with invalid parameters.
       -- 2. Assert that v:shell_error was NOT modified.
-      feed_command('call system({})')
+      feed(':call system({})<CR>')
       eq(old_val, eval('v:shell_error'))
-      feed_command('call system([])')
+      feed(':call system([])<CR>')
       eq(old_val, eval('v:shell_error'))
     end)
 
@@ -298,8 +297,8 @@ describe('system()', function()
     end)
     it('to backgrounded command does not crash', function()
       -- This is indeterminate, just exercise the codepath. May get E5677.
-      feed_command(
-        'call system(has("win32") ? "start /b /wait cmd /c echo echoed" : "printf echoed &")'
+      feed(
+        ':call system(has("win32") ? "start /b /wait cmd /c echo echoed" : "printf echoed &")<CR>'
       )
       local v_errnum = string.match(eval('v:errmsg'), '^E%d*:')
       if v_errnum then
@@ -315,7 +314,7 @@ describe('system()', function()
     end)
     it('to backgrounded command does not crash', function()
       -- This is indeterminate, just exercise the codepath. May get E5677.
-      feed_command('call system(has("win32") ? "start /b /wait more" : "cat - &", "input")')
+      feed(':call system(has("win32") ? "start /b /wait more" : "cat - &", "input")<CR>')
       local v_errnum = string.match(eval('v:errmsg'), '^E%d*:')
       if v_errnum then
         eq('E5677:', v_errnum)
@@ -347,7 +346,7 @@ describe('system()', function()
     it('is treated as a buffer id', function()
       command("put ='text in buffer 1'")
       eq('\ntext in buffer 1\n', eval('system("cat", 1)'))
-      eq('Vim(echo):E86: Buffer 42 does not exist', exc_exec('echo system("cat", 42)'))
+      eq('Vim(echo):E86: Buffer 42 does not exist', pcall_err(command, 'echo system("cat", 42)'))
     end)
   end)
 

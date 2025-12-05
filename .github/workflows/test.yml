@@ -2,11 +2,11 @@ name: test
 on:
   push:
     branches:
-      - 'master'
+      - 'test_deprecate_1'
       - 'release-[0-9]+.[0-9]+'
   pull_request:
     branches:
-      - 'master'
+      - 'test_deprecate_1'
       - 'release-[0-9]+.[0-9]+'
   workflow_dispatch:
 

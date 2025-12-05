@@ -3,7 +3,7 @@
 local n = require('test.functional.testnvim')()
 
 local clear, feed, insert = n.clear, n.feed, n.insert
-local feed_command, expect = n.feed_command, n.expect
+local expect = n.expect
 
 describe('028', function()
   before_each(clear)
@@ -25,8 +25,8 @@ describe('028', function()
 
     feed(':%s/X/<C-v><C-v>/g<cr>')
     feed(':/firstline/+1,/lastline/-1w! Xtestfile<cr>')
-    feed_command('so Xtestfile')
-    feed_command('%d')
+    feed(':so Xtestfile<CR>')
+    feed(':%d<CR>')
     feed('Gmm__1<Esc><Esc>__2<Esc>__3<Esc><Esc>__4<Esc>__5<Esc>')
     feed(":'m,$s/<C-v><C-@>/0/g<cr>")
 
@@ -40,9 +40,9 @@ describe('028', function()
       12352
 
       12354]])
-    feed_command('/12352')
+    feed(':/12352<CR>')
     feed('<C-A>')
-    feed_command('/12354')
+    feed(':/12354<CR>')
     feed('<C-X>')
     expect([[
       12353
