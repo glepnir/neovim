@@ -480,6 +480,7 @@ EXTERN int p_stmp;              ///< 'shelltemp'
 EXTERN int p_ssl;               ///< 'shellslash'
 #endif
 EXTERN char *p_stl;             ///< 'statusline'
+EXTERN char *p_stlb;            ///< 'statuslineborder'
 EXTERN char *p_wbr;             ///< 'winbar'
 EXTERN int p_sr;                ///< 'shiftround'
 EXTERN OptInt p_sw;             ///< 'shiftwidth'

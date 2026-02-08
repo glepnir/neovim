@@ -1158,7 +1158,7 @@ win_T *win_split_ins(int size, int flags, win_T *new_wp, int dir, frame_T *to_fl
       emsg(_(e_noroom));
       return NULL;
     }
-    need_status = STATUS_HEIGHT;
+    need_status = get_status_height();
     win_float_anchor_laststatus();
   }
 
@@ -1245,7 +1245,7 @@ win_T *win_split_ins(int size, int flags, win_T *new_wp, int dir, frame_T *to_fl
     // Check if we are able to split the current window and compute its height.
     // Current window requires at least 1 space plus space for the window bar.
     int wmh1 = MAX((int)p_wmh, 1) + oldwin->w_winbar_height;
-    int needed = wmh1 + STATUS_HEIGHT;
+    int needed = wmh1 + get_status_height();
     if (flags & WSP_ROOM) {
       needed += (int)p_wh - wmh1 + oldwin->w_winbar_height;
     }
@@ -1285,17 +1285,17 @@ win_T *win_split_ins(int size, int flags, win_T *new_wp, int dir, frame_T *to_fl
     }
     oldwin_height = oldwin->w_height;
     if (need_status) {
-      oldwin->w_status_height = STATUS_HEIGHT;
-      oldwin_height -= STATUS_HEIGHT;
+      oldwin->w_status_height = get_status_height();
+      oldwin_height -= get_status_height();
     }
     if (new_size == 0) {
       new_size = oldwin_height / 2;
     }
 
-    new_size = MAX(MIN(new_size, available - minheight - STATUS_HEIGHT), wmh1);
+    new_size = MAX(MIN(new_size, available - minheight - get_status_height()), wmh1);
 
     // if it doesn't fit in the current window, need win_equal()
-    if (oldwin_height - new_size - STATUS_HEIGHT < p_wmh) {
+    if (oldwin_height - new_size - get_status_height() < p_wmh) {
       do_equal = true;
     }
 
@@ -1308,11 +1308,11 @@ win_T *win_split_ins(int size, int flags, win_T *new_wp, int dir, frame_T *to_fl
       set_fraction(oldwin);
       did_set_fraction = true;
 
-      win_setheight_win(oldwin->w_height + new_size + STATUS_HEIGHT,
+      win_setheight_win(oldwin->w_height + new_size + get_status_height(),
                         oldwin);
       oldwin_height = oldwin->w_height;
       if (need_status) {
-        oldwin_height -= STATUS_HEIGHT;
+        oldwin_height -= get_status_height();
       }
     }
 
@@ -1325,7 +1325,7 @@ win_T *win_split_ins(int size, int flags, win_T *new_wp, int dir, frame_T *to_fl
       while (frp != NULL) {
         if (frp->fr_win != oldwin && frp->fr_win != NULL
             && (frp->fr_win->w_height > new_size
-                || frp->fr_win->w_height > oldwin_height - new_size - STATUS_HEIGHT)) {
+                || frp->fr_win->w_height > oldwin_height - new_size - get_status_height())) {
           do_equal = true;
           break;
         }
@@ -1550,7 +1550,7 @@ win_T *win_split_ins(int size, int flags, win_T *new_wp, int dir, frame_T *to_fl
         }
       } else {
         if (!((flags & WSP_BOT) && p_ls == 0)) {
-          new_fr_height -= STATUS_HEIGHT;
+          new_fr_height -= get_status_height();
         }
         if (flags & WSP_BOT) {
           frame_add_statusline(curfrp);
@@ -1558,7 +1558,7 @@ win_T *win_split_ins(int size, int flags, win_T *new_wp, int dir, frame_T *to_fl
       }
       frame_new_height(curfrp, new_fr_height, flags & WSP_TOP, false, false);
     } else {
-      win_new_height(oldwin, oldwin_height - (new_size + STATUS_HEIGHT));
+      win_new_height(oldwin, oldwin_height - (new_size + get_status_height()));
     }
 
     if (before) {       // new window above current one
@@ -1567,18 +1567,18 @@ win_T *win_split_ins(int size, int flags, win_T *new_wp, int dir, frame_T *to_fl
         wp->w_status_height = 0;
         oldwin->w_winrow += wp->w_height + 1;
       } else {
-        wp->w_status_height = STATUS_HEIGHT;
-        oldwin->w_winrow += wp->w_height + STATUS_HEIGHT;
+        wp->w_status_height = get_status_height();
+        oldwin->w_winrow += wp->w_height + get_status_height();
       }
     } else {            // new window below current one
       if (is_stl_global) {
         wp->w_winrow = oldwin->w_winrow + oldwin->w_height + 1;
         wp->w_status_height = 0;
       } else {
-        wp->w_winrow = oldwin->w_winrow + oldwin->w_height + STATUS_HEIGHT;
+        wp->w_winrow = oldwin->w_winrow + oldwin->w_height + get_status_height();
         wp->w_status_height = old_status_height;
         if (!(flags & WSP_BOT)) {
-          oldwin->w_status_height = STATUS_HEIGHT;
+          oldwin->w_status_height = get_status_height();
         }
       }
     }
@@ -1816,7 +1816,7 @@ int make_windows(int count, bool vertical)
     // If statusline isn't global, each window also needs a statusline.
     // If 'winbar' is set, each window also needs a winbar.
     maxcount = (int)(curwin->w_height + curwin->w_hsep_height + curwin->w_status_height
-                     - (p_wh - p_wmh)) / ((int)p_wmh + STATUS_HEIGHT + global_winbar_height());
+                     - (p_wh - p_wmh)) / ((int)p_wmh + get_status_height() + global_winbar_height());
   }
 
   maxcount = MAX(maxcount, 2);
@@ -1842,8 +1842,8 @@ int make_windows(int count, bool vertical)
       }
     } else {
       if (win_split(curwin->w_height - (curwin->w_height - todo
-                                        * STATUS_HEIGHT) / (todo + 1)
-                    - STATUS_HEIGHT, WSP_ABOVE) == FAIL) {
+                                        * get_status_height()) / (todo + 1)
+                    - get_status_height(), WSP_ABOVE) == FAIL) {
         break;
       }
     }
@@ -2155,10 +2155,10 @@ void win_move_after(win_T *win1, win_T *win2)
 static int get_maximum_wincount(frame_T *fr, int height)
 {
   if (fr->fr_layout != FR_COL) {
-    return (height / ((int)p_wmh + STATUS_HEIGHT + frame2win(fr)->w_winbar_height));
+    return (height / ((int)p_wmh + get_status_height() + frame2win(fr)->w_winbar_height));
   } else if (global_winbar_height()) {
     // If winbar is globally enabled, no need to check each window for it.
-    return (height / ((int)p_wmh + STATUS_HEIGHT + 1));
+    return (height / ((int)p_wmh + get_status_height() + 1));
   }
 
   frame_T *frp;
@@ -2168,16 +2168,16 @@ static int get_maximum_wincount(frame_T *fr, int height)
   FOR_ALL_FRAMES(frp, fr->fr_child) {
     win_T *wp = frame2win(frp);
 
-    if (height < (p_wmh + STATUS_HEIGHT + wp->w_winbar_height)) {
+    if (height < (p_wmh + get_status_height() + wp->w_winbar_height)) {
       break;
     }
-    height -= (int)p_wmh + STATUS_HEIGHT + wp->w_winbar_height;
+    height -= (int)p_wmh + get_status_height() + wp->w_winbar_height;
     total_wincount += 1;
   }
 
   // If we still have enough room for more windows, just use the default winbar height (which is 0)
   // in order to get the amount of windows that'd fit in the remaining space
-  total_wincount += height / ((int)p_wmh + STATUS_HEIGHT);
+  total_wincount += height / ((int)p_wmh + get_status_height());
 
   return total_wincount;
 }
@@ -2367,7 +2367,7 @@ static void win_equal_rec(win_T *next_curwin, bool current, frame_T *topfr, int 
       int n = frame_minheight(topfr, NOWIN);
       // add one for the bottom window if it doesn't have a statusline or separator
       if (row + height >= cmdline_row && p_ls == 0) {
-        extra_sep = STATUS_HEIGHT;
+        extra_sep = get_status_height();
       } else if (global_stl_height() > 0) {
         extra_sep = 1;
       } else {
@@ -3927,7 +3927,7 @@ static void frame_add_statusline(frame_T *frp)
 {
   if (frp->fr_layout == FR_LEAF) {
     win_T *wp = frp->fr_win;
-    wp->w_status_height = STATUS_HEIGHT;
+    wp->w_status_height = get_status_height();
   } else if (frp->fr_layout == FR_ROW) {
     // Handle all the frames in the row.
     FOR_ALL_FRAMES(frp, frp->fr_child) {
@@ -6963,7 +6963,7 @@ void win_set_inner_size(win_T *wp, bool valid_cursor)
     terminal_check_size(wp->w_buffer->terminal);
   }
 
-  int float_stl_height = wp->w_floating && wp->w_status_height ? STATUS_HEIGHT : 0;
+  int float_stl_height = wp->w_floating && wp->w_status_height ? get_status_height() : 0;
   wp->w_height_outer = (wp->w_view_height + win_border_height(wp) + wp->w_winbar_height +
                         float_stl_height);
   wp->w_width_outer = (wp->w_view_width + win_border_width(wp));
@@ -7091,7 +7091,7 @@ void win_remove_status_line(win_T *wp, bool add_hsep)
   if (add_hsep) {
     wp->w_hsep_height = 1;
   } else {
-    win_new_height(wp, (wp->w_floating ? wp->w_view_height : wp->w_height) + STATUS_HEIGHT);
+    win_new_height(wp, (wp->w_floating ? wp->w_view_height : wp->w_height) + get_status_height());
   }
   comp_col();
 
@@ -7174,7 +7174,7 @@ static void last_status_rec(frame_T *fr, bool statusline, bool is_stl_global)
         win_remove_status_line(wp, false);
       } else if (wp->w_status_height == 0 && !is_stl_global && statusline) {
         // Add statusline to window if needed
-        wp->w_status_height = STATUS_HEIGHT;
+        wp->w_status_height = get_status_height();
         if (!resize_frame_for_status(fr)) {
           return;
         }
@@ -7190,7 +7190,7 @@ static void last_status_rec(frame_T *fr, bool statusline, bool is_stl_global)
       win_remove_status_line(wp, true);
     } else if (wp->w_status_height == 0 && !is_stl_global) {
       // If statusline isn't global and the window doesn't have a statusline, re-add it
-      wp->w_status_height = STATUS_HEIGHT;
+      wp->w_status_height = get_status_height();
       wp->w_hsep_height = 0;
       comp_col();
     }
@@ -7277,7 +7277,7 @@ int global_winbar_height(void)
 /// Return the number of lines used by the global statusline
 int global_stl_height(void)
 {
-  return (p_ls == 3) ? STATUS_HEIGHT : 0;
+  return (p_ls == 3) ? get_status_height() : 0;
 }
 
 /// Return the height of the last window's statusline, or the global statusline if set.
@@ -7285,7 +7285,7 @@ int global_stl_height(void)
 /// @param morewin  pretend there are two or more windows if true.
 int last_stl_height(bool morewin)
 {
-  return (p_ls > 1 || (p_ls == 1 && (morewin || !one_window(firstwin, NULL)))) ? STATUS_HEIGHT : 0;
+  return (p_ls > 1 || (p_ls == 1 && (morewin || !one_window(firstwin, NULL)))) ? get_status_height() : 0;
 }
 
 /// Return the minimal number of rows that is needed on the screen to display

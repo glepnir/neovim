@@ -51,6 +51,14 @@
 #include "nvim/undo.h"
 #include "nvim/window.h"
 
+
+#define STL_BORDER_TOP_LEFT     "┌"
+#define STL_BORDER_TOP_RIGHT    "┐"
+#define STL_BORDER_BOTTOM_LEFT  "└"
+#define STL_BORDER_BOTTOM_RIGHT "┘"
+#define STL_BORDER_HORIZONTAL   "─"
+#define STL_BORDER_VERTICAL     "│"
+
 // Determines how deeply nested %{} blocks will be evaluated in statusline.
 #define MAX_STL_EVAL_DEPTH 100
 
@@ -208,6 +216,57 @@ void stl_fill_click_defs(StlClickDefinition *click_defs, StlClickRecord *click_r
   }
 }
 
+/// 绘制水平边框线
+static void draw_stl_horizontal_border(int row, int start_col, int end_col,
+                                        const char *left, const char *middle,
+                                        const char *right, int attr)
+{
+  if (end_col <= start_col) {
+    return;
+  }
+
+  grid_line_start(&default_gridview, row);
+
+  schar_T mid_sc = schar_from_str(middle);
+
+  // 左角
+  if (left && start_col < end_col) {
+    grid_line_put_schar(start_col++, schar_from_str(left), attr);
+  }
+
+  // 横线
+  int last_col = right ? end_col - 1 : end_col;
+  for (int col = start_col; col < last_col; col++) {
+    grid_line_put_schar(col, mid_sc, attr);
+  }
+
+  // 右角
+  if (right && last_col < end_col) {
+    grid_line_put_schar(last_col, schar_from_str(right), attr);
+  }
+
+  grid_line_flush();
+}
+
+static bool stl_border_enabled = true;
+
+/// 绘制垂直边框字符
+static inline int draw_stl_vertical_border(int col, schar_T vert_sc, int attr)
+{
+  grid_line_put_schar(col, vert_sc, attr);
+  return col + 1;
+}
+
+/// 判断是否应该绘制边框
+static bool should_draw_stl_border(win_T *wp, bool draw_winbar, bool draw_ruler)
+{
+  return stl_border_enabled && wp && !draw_winbar && !draw_ruler && !wp->w_floating;
+}
+
+int get_status_height(void) {
+  return stl_border_enabled ? 3 : STATUS_HEIGHT;
+}
+
 static bool did_show_ext_ruler = false;
 /// Redraw the status line, window bar, ruler or tabline.
 /// @param wp  target window, NULL for 'tabline'
@@ -231,6 +290,13 @@ static void win_redr_custom(win_T *wp, bool draw_winbar, bool draw_ruler, bool u
   bool is_stl_global = global_stl_height() > 0;
 
   ScreenGrid *grid = wp && wp->w_floating && !is_stl_global ? &wp->w_grid_alloc : &default_grid;
+
+  // Check if we should draw statusline borders
+  bool draw_stl_border = should_draw_stl_border(wp, draw_winbar, draw_ruler);
+
+  // Vertical border character (convert once for efficiency)
+  schar_T vert_border_sc = 0;
+  int border_attr = syn_name2attr("FloatBorder");
 
   // There is a tiny chance that this gets called recursively: When
   // redrawing a status line triggers redrawing the ruler or tabline.
@@ -277,7 +343,19 @@ static void win_redr_custom(win_T *wp, bool draw_winbar, bool draw_ruler, bool u
       maxwidth = wp->w_view_width;
     } else {
       row = is_stl_global ? (Rows - (int)p_ch - 1) : W_ENDROW(wp);
+      if (draw_stl_border && wp->w_status_height == 3) {
+        // w_status_height = 3 时，W_ENDROW 指向底部边框
+        // 内容行应该在 W_ENDROW - 1
+        row = row + 1;
+      }
       maxwidth = in_status_line && !is_stl_global ? wp->w_width : Columns;
+      // Reserve space for left and right borders
+      if (draw_stl_border) {
+        maxwidth -= 2;  // -1 for left border, -1 for right border
+        if (maxwidth < 1) {
+          maxwidth = 1;  // Minimum width
+        }
+      }
     }
     fillchar = fillchar_status(&group, wp);
     stl_clear_click_defs(wp->w_status_click_defs, wp->w_status_click_defs_size);
@@ -320,6 +398,10 @@ static void win_redr_custom(win_T *wp, bool draw_winbar, bool draw_ruler, bool u
     if (!wp->w_floating && in_status_line && !is_stl_global) {
       col += wp->w_wincol;
     }
+    // Set border attribute and character
+    if (draw_stl_border) {
+      vert_border_sc = schar_from_str(STL_BORDER_VERTICAL);
+    }
   }
 
   if (maxwidth <= 0) {
@@ -343,10 +425,25 @@ static void win_redr_custom(win_T *wp, bool draw_winbar, bool draw_ruler, bool u
 
   int len = (int)strlen(buf);
   int start_col = col;
+  int border_start_col = col;
+
+  // Draw top border before statusline content
+  if (draw_stl_border && !ui_event) {
+    draw_stl_horizontal_border(row - 1, border_start_col, border_start_col + maxwidth + 2,
+                               STL_BORDER_TOP_LEFT,
+                               STL_BORDER_HORIZONTAL,
+                               STL_BORDER_TOP_RIGHT,
+                               border_attr);
+  }
+
 
   if (!ui_event) {
     // Draw each snippet with the specified highlighting.
     screengrid_line_start(grid, row, 0);
+    // Draw left vertical border
+    if (draw_stl_border) {
+      col = draw_stl_vertical_border(col, vert_border_sc, border_attr);
+    }
   }
 
   char *p = buf;
@@ -397,10 +494,26 @@ static void win_redr_custom(win_T *wp, bool draw_winbar, bool draw_ruler, bool u
   }
 
   int maxcol = start_col + maxwidth;
+  if (draw_stl_border) {
+    maxcol += 2;  // Account for borders in total width
+  }
 
   // fill up with "fillchar"
-  grid_line_fill(col, maxcol, fillchar, curattr);
+  // grid_line_fill(col, maxcol, fillchar, curattr);
+  if (draw_stl_border) {
+    grid_line_fill(col, maxcol - 1, fillchar, curattr);
+    // Draw right vertical border
+    draw_stl_vertical_border(maxcol - 1, vert_border_sc, border_attr);
+  } else {
+    grid_line_fill(col, maxcol, fillchar, curattr);
+  }
   grid_line_flush();
+  // Draw bottom border after statusline content
+  if (draw_stl_border && !ui_event) {
+    draw_stl_horizontal_border(row + 1, border_start_col, border_start_col + maxwidth + 2,
+                               STL_BORDER_BOTTOM_LEFT, STL_BORDER_HORIZONTAL,
+                               STL_BORDER_BOTTOM_RIGHT, border_attr);
+  }
 
   // Fill the tab_page_click_defs, w_status_click_defs or w_winbar_click_defs array for clicking
   // in the tab page line, status line or window bar
