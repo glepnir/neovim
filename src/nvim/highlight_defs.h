@@ -164,6 +164,12 @@ typedef struct {
 #define ColorKey(n, s) (ColorKey) { .ns_id = (int)(n), .syn_id = (s) }
 
 typedef struct {
+  int id1;
+  int id2;
+} HlAttrKey;
+#define HlAttrKey(a, b) (HlAttrKey) { .id1 = (a), .id2 = (b) }
+
+typedef struct {
   int attr_id;
   int link_id;
   int version;
