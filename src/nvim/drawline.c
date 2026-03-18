@@ -1107,13 +1107,12 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
   int n_extra_next = 0;                 // n_extra to use after current extra chars
   int extra_attr_next = -1;             // extra_attr to use after current extra chars
 
-  bool search_attr_from_match = false;  // if search_attr is from :match
+  bool search_attr_from_match = false;  // if extmark_attr includes a matchadd highlight
   bool has_decor = false;               // this buffer has decoration
 
   int saved_search_attr = 0;            // search_attr to be used when n_extra goes to zero
   int saved_area_attr = 0;              // idem for area_attr
   int saved_decor_attr = 0;             // idem for decor_attr
-  bool saved_search_attr_from_match = false;
 
   int win_col_offset = 0;               // offset for window columns
   bool area_active = false;             // whether in Visual selection, for virtual text
@@ -1130,7 +1129,6 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
   int left_curline_col = 0;
   int right_curline_col = 0;
 
-  int match_conc = 0;              ///< cchar for match functions
   bool on_last_col = false;
   int syntax_flags = 0;
   int syntax_seqnr = 0;
@@ -1643,9 +1641,17 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
 
   if (col_rows == 0 && draw_text && !has_foldtext) {
     const int v = (int)(ptr - line);
+
+    // Inject matchadd()/matchaddpos() highlights as ephemeral DecorState ranges.
+    // Must run after decor_redraw_line() and before the main char loop.
+    if (wp->w_match_head != NULL) {
+      match_fill_line_extmarks(wp, lnum);
+      has_decor = true;
+      extra_check = true;
+    }
+
     area_highlighting |= prepare_search_hl_line(wp, lnum, v,
-                                                &line, &screen_search_hl, &search_attr,
-                                                &search_attr_from_match);
+                                                &line, &screen_search_hl, &search_attr);
     ptr = line + v;  // "line" may have been updated
   }
 
@@ -1672,7 +1678,6 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
 
   // Repeat for each cell in the displayed line.
   while (true) {
-    int has_match_conc = 0;  ///< match wants to conceal
     int decor_conceal = 0;
 
     bool did_decrement_ptr = false;
@@ -1857,6 +1862,9 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
         extmark_attr = decor_redraw_col(wp, (colnr_T)(ptr - line),
                                         may_have_inline_virt ? -3 : wlv.off,
                                         selected, &decor_state);
+        // Track whether the current position is inside a matchadd/match region.
+        // Used to prevent listchars extra_attr from overriding the match highlight.
+        search_attr_from_match = (wp->w_match_head != NULL && extmark_attr != 0);
         if (may_have_inline_virt) {
           handle_inline_virtual_text(wp, &wlv, ptr - line, selected);
           if (wlv.n_extra > 0 && wlv.virt_inline_hl_mode <= kHlModeReplace) {
@@ -1865,11 +1873,9 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
             saved_search_attr = search_attr;
             saved_area_attr = area_attr;
             saved_decor_attr = decor_attr;
-            saved_search_attr_from_match = search_attr_from_match;
             search_attr = 0;
             area_attr = 0;
             decor_attr = 0;
-            search_attr_from_match = false;
           }
         }
       }
@@ -1896,20 +1902,11 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
       }
 
       if (!has_foldtext && wlv.n_extra == 0) {
-        // Check for start/end of 'hlsearch' and other matches.
-        // After end, check for start/end of next match.
-        // When another match, have to check for start again.
+        // Check for start/end of 'hlsearch'.
         const int v = (int)(ptr - line);
         search_attr = update_search_hl(wp, lnum, v, &line, &screen_search_hl,
-                                       &has_match_conc, &match_conc, lcs_eol_todo,
-                                       &on_last_col, &search_attr_from_match);
+                                       lcs_eol_todo, &on_last_col);
         ptr = line + v;  // "line" may have been changed
-
-        // Do not allow a conceal over EOL otherwise EOL will be missed
-        // and bad things happen.
-        if (*ptr == NUL) {
-          has_match_conc = 0;
-        }
 
         // Check if ComplMatchIns highlight is needed.
         if ((State & MODE_INSERT) && ins_compl_win_active(wp)
@@ -2147,7 +2144,7 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
         wlv.n_extra = (int)strlen(wlv.p_extra);
         wlv.sc_extra = NUL;
         wlv.sc_final = NUL;
-        if (area_attr == 0 && search_attr == 0) {
+        if (area_attr == 0 && search_attr == 0 && !search_attr_from_match) {
           wlv.n_attr = wlv.n_extra + 1;
           wlv.extra_attr = win_hl_attr(wp, HLF_8);
           saved_attr2 = wlv.char_attr;               // save current attr
@@ -2180,7 +2177,7 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
         mb_schar = schar_from_ascii(' ');
         mb_c = ' ';
         mb_l = 1;
-        if (area_attr == 0 && search_attr == 0) {
+        if (area_attr == 0 && search_attr == 0 && !search_attr_from_match) {
           wlv.n_attr = wlv.n_extra + 1;
           wlv.extra_attr = win_hl_attr(wp, HLF_AT);
           saved_attr2 = wlv.char_attr;             // save current attr
@@ -2607,14 +2604,13 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
 
       if (wp->w_p_cole > 0
           && (wp != curwin || lnum != wp->w_cursor.lnum || conceal_cursor_line(wp))
-          && ((syntax_flags & HL_CONCEAL) != 0 || has_match_conc > 0 || decor_conceal > 0)
+          && ((syntax_flags & HL_CONCEAL) != 0 || decor_conceal > 0)
           && !(lnum_in_visual_area && vim_strchr(wp->w_p_cocu, 'v') == NULL)) {
         bool syntax_conceal = (syntax_flags & HL_CONCEAL) != 0;
         wlv.char_attr = conceal_attr;
         if (((prev_syntax_id != syntax_seqnr && syntax_conceal)
-             || has_match_conc > 1 || decor_conceal > 1)
+             || decor_conceal > 1)
             && ((syntax_conceal && syn_get_sub_char() != NUL)
-                || (has_match_conc && match_conc)
                 || (decor_conceal && decor_state.conceal_char)
                 || wp->w_p_cole == 1)
             && wp->w_p_cole != 3) {
@@ -2624,11 +2620,8 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
             wlv.n_extra++;
           }
 
-          // First time at this concealed item: display one
-          // character.
-          if (has_match_conc && match_conc) {
-            mb_schar = schar_from_char(match_conc);
-          } else if (decor_conceal && decor_state.conceal_char) {
+          // First time at this concealed item: display one character.
+          if (decor_conceal && decor_state.conceal_char) {
             mb_schar = decor_state.conceal_char;
             if (decor_state.conceal_attr) {
               wlv.char_attr = decor_state.conceal_attr;
@@ -2687,7 +2680,8 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
       wp->w_valid |= VALID_WCOL|VALID_WROW|VALID_VIRTCOL;
     }
 
-    // Use "wlv.extra_attr", but don't override visual selection highlighting.
+    // Use "wlv.extra_attr", but don't override visual selection highlighting
+    // or matchadd/match highlighting.
     if (wlv.n_attr > 0 && !search_attr_from_match) {
       wlv.char_attr = hl_combine_attr(wlv.char_attr, wlv.extra_attr);
       if (wlv.reset_extra_attr) {
@@ -2697,8 +2691,6 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
           extra_attr_next = -1;
         } else {
           wlv.extra_attr = 0;
-          // search_attr_from_match can be restored now that the extra_attr has been applied
-          search_attr_from_match = saved_search_attr_from_match;
         }
       }
     }

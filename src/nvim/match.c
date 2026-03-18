@@ -9,6 +9,8 @@
 #include "nvim/ascii_defs.h"
 #include "nvim/buffer_defs.h"
 #include "nvim/charset.h"
+#include "nvim/decoration.h"
+#include "nvim/decoration_defs.h"
 #include "nvim/drawscreen.h"
 #include "nvim/errors.h"
 #include "nvim/eval/funcs.h"
@@ -19,6 +21,7 @@
 #include "nvim/fold.h"
 #include "nvim/gettext_defs.h"
 #include "nvim/globals.h"
+#include "nvim/grid.h"
 #include "nvim/highlight.h"
 #include "nvim/highlight_defs.h"
 #include "nvim/highlight_group.h"
@@ -294,114 +297,51 @@ static matchitem_T *get_match(win_T *wp, int id)
 void init_search_hl(win_T *wp, match_T *search_hl)
   FUNC_ATTR_NONNULL_ALL
 {
-  // Setup for match and 'hlsearch' highlighting.  Disable any previous
-  // match
-  matchitem_T *cur = wp->w_match_head;
-  while (cur != NULL) {
-    cur->mit_hl.rm = cur->mit_match;
-    if (cur->mit_hlg_id == 0) {
-      cur->mit_hl.attr = 0;
-    } else {
-      cur->mit_hl.attr = syn_id2attr(cur->mit_hlg_id);
-    }
-    cur->mit_hl.buf = wp->w_buffer;
-    cur->mit_hl.lnum = 0;
-    cur->mit_hl.first_lnum = 0;
-    // Set the time limit to 'redrawtime'.
-    cur->mit_hl.tm = profile_setlimit(p_rdt);
-    cur = cur->mit_next;
-  }
+  // Setup for 'hlsearch' highlighting only.
+  // matchadd()/matchaddpos() are handled per-line by match_fill_line_extmarks().
   search_hl->buf = wp->w_buffer;
   search_hl->lnum = 0;
   search_hl->first_lnum = 0;
   search_hl->attr = win_hl_attr(wp, HLF_L);
 
+  // Initialise multi-line prescan state for regex-based matchadd() items.
+  for (matchitem_T *cur = wp->w_match_head; cur != NULL; cur = cur->mit_next) {
+    if (cur->mit_match.regprog == NULL || !re_multiline(cur->mit_match.regprog)) {
+      cur->mit_ml_first_lnum = 0;
+      continue;
+    }
+    // Shared regprog pointer — do NOT free cur->mit_ml_rm.regprog independently.
+    cur->mit_ml_rm = cur->mit_match;
+    cur->mit_ml_first_lnum = 0;  // computed lazily on first prescan call
+    cur->mit_ml_tm = profile_setlimit(p_rdt);
+  }
+
   // time limit is set at the toplevel, for all windows
 }
 
-/// @param shl       points to a match. Fill on match.
-/// @param posmatch  match item with positions
-/// @param mincol    minimal column for a match
-///
-/// @return one on match, otherwise return zero.
-static int next_search_hl_pos(match_T *shl, linenr_T lnum, matchitem_T *match, colnr_T mincol)
-  FUNC_ATTR_NONNULL_ALL
-{
-  int found = -1;
-
-  shl->lnum = 0;
-  for (int i = match->mit_pos_cur; i < match->mit_pos_count; i++) {
-    llpos_T *pos = &match->mit_pos_array[i];
-
-    if (pos->lnum == 0) {
-      break;
-    }
-    if (pos->len == 0 && pos->col < mincol) {
-      continue;
-    }
-    if (pos->lnum == lnum) {
-      if (found >= 0) {
-        // if this match comes before the one at "found" then swap them
-        if (pos->col < match->mit_pos_array[found].col) {
-          llpos_T tmp = *pos;
-
-          *pos = match->mit_pos_array[found];
-          match->mit_pos_array[found] = tmp;
-        }
-      } else {
-        found = i;
-      }
-    }
-  }
-  match->mit_pos_cur = 0;
-  if (found >= 0) {
-    colnr_T start = match->mit_pos_array[found].col == 0
-                    ? 0 : match->mit_pos_array[found].col - 1;
-    colnr_T end = match->mit_pos_array[found].col == 0
-                  ? MAXCOL : start + match->mit_pos_array[found].len;
-
-    shl->lnum = lnum;
-    shl->rm.startpos[0].lnum = 0;
-    shl->rm.startpos[0].col = start;
-    shl->rm.endpos[0].lnum = 0;
-    shl->rm.endpos[0].col = end;
-    shl->is_addpos = true;
-    shl->has_cursor = false;
-    match->mit_pos_cur = found + 1;
-    return 1;
-  }
-  return 0;
-}
-
-/// Search for a next 'hlsearch' or match.
+/// Search for a next 'hlsearch' match.
 /// Uses shl->buf.
 /// Sets shl->lnum and shl->rm contents.
 /// Note: Assumes a previous match is always before "lnum", unless
 /// shl->lnum is zero.
 /// Careful: Any pointers for buffer lines will become invalid.
 ///
-/// @param shl     points to search_hl or a match
+/// @param shl     points to search_hl
 /// @param mincol  minimal column for a match
-/// @param cur     to retrieve match positions if any
-static void next_search_hl(win_T *win, match_T *search_hl, match_T *shl, linenr_T lnum,
-                           colnr_T mincol, matchitem_T *cur)
-  FUNC_ATTR_NONNULL_ARG(2)
+static void next_search_hl(win_T *win, match_T *shl, linenr_T lnum, colnr_T mincol)
+  FUNC_ATTR_NONNULL_ALL
 {
   colnr_T matchcol;
   int nmatched = 0;
   const int called_emsg_before = called_emsg;
 
   // for :{range}s/pat only highlight inside the range
-  if ((lnum < search_first_line || lnum > search_last_line) && cur == NULL) {
+  if (lnum < search_first_line || lnum > search_last_line) {
     shl->lnum = 0;
     return;
   }
 
   if (shl->lnum != 0) {
-    // Check for three situations:
-    // 1. If the "lnum" is below a previous match, start a new search.
-    // 2. If the previous match includes "mincol", use it.
-    // 3. Continue after the previous match.
     linenr_T l = shl->lnum + shl->rm.endpos[0].lnum - shl->rm.startpos[0].lnum;
     if (lnum > l) {
       shl->lnum = 0;
@@ -410,19 +350,11 @@ static void next_search_hl(win_T *win, match_T *search_hl, match_T *shl, linenr_
     }
   }
 
-  // Repeat searching for a match until one is found that includes "mincol"
-  // or none is found in this line.
   while (true) {
-    // Stop searching after passing the time limit.
     if (profile_passed_limit(shl->tm)) {
-      shl->lnum = 0;                    // no match found in time
+      shl->lnum = 0;
       break;
     }
-    // Three situations:
-    // 1. No useful previous match: search from start of line.
-    // 2. Not Vi compatible or empty match: continue at next character.
-    //    Break the loop if this is beyond the end of the line.
-    // 3. Vi compatible searching: continue at end of previous match.
     if (shl->lnum == 0) {
       matchcol = 0;
     } else if (vim_strchr(p_cpo, CPO_SEARCH) == NULL
@@ -442,36 +374,22 @@ static void next_search_hl(win_T *win, match_T *search_hl, match_T *shl, linenr_
 
     shl->lnum = lnum;
     if (shl->rm.regprog != NULL) {
-      // Remember whether shl->rm is using a copy of the regprog in
-      // cur->mit_match.
-      bool regprog_is_copy = (shl != search_hl && cur != NULL
-                              && shl == &cur->mit_hl
-                              && cur->mit_match.regprog == cur->mit_hl.rm.regprog);
       int timed_out = false;
-
       nmatched = vim_regexec_multi(&shl->rm, win, shl->buf, lnum, matchcol,
                                    &(shl->tm), &timed_out);
-      // Copy the regprog, in case it got freed and recompiled.
-      if (regprog_is_copy) {
-        cur->mit_match.regprog = cur->mit_hl.rm.regprog;
-      }
       if (called_emsg > called_emsg_before || got_int || timed_out) {
-        // Error while handling regexp: stop using this regexp.
-        if (shl == search_hl) {
-          // don't free regprog in the match list, it's a copy
-          vim_regfree(shl->rm.regprog);
-          set_no_hlsearch(true);
-        }
+        vim_regfree(shl->rm.regprog);
+        set_no_hlsearch(true);
         shl->rm.regprog = NULL;
         shl->lnum = 0;
-        got_int = false;  // avoid the "Type :quit to exit Vim" message
+        got_int = false;
         break;
       }
-    } else if (cur != NULL) {
-      nmatched = next_search_hl_pos(shl, lnum, cur, matchcol);
+    } else {
+      nmatched = 0;
     }
     if (nmatched == 0) {
-      shl->lnum = 0;                    // no match found
+      shl->lnum = 0;
       break;
     }
     if (shl->rm.startpos[0].lnum > 0
@@ -479,7 +397,7 @@ static void next_search_hl(win_T *win, match_T *search_hl, match_T *shl, linenr_
         || nmatched > 1
         || shl->rm.endpos[0].col > mincol) {
       shl->lnum += shl->rm.startpos[0].lnum;
-      break;                            // useful match found
+      break;
     }
   }
 }
@@ -488,56 +406,34 @@ static void next_search_hl(win_T *win, match_T *search_hl, match_T *shl, linenr_
 void prepare_search_hl(win_T *wp, match_T *search_hl, linenr_T lnum)
   FUNC_ATTR_NONNULL_ALL
 {
-  matchitem_T *cur = wp->w_match_head;  // points to the match list
-  match_T *shl;       // points to search_hl or a match
-  bool shl_flag = false;  // flag to indicate whether search_hl has been processed or not
+  // Only handle hlsearch multi-line pattern prescan.
+  // matchadd() regex matches are handled by match_fill_line_extmarks().
+  match_T *shl = search_hl;
 
-  // When using a multi-line pattern, start searching at the top
-  // of the window or just after a closed fold.
-  // Do this both for search_hl and the match list.
-  while (cur != NULL || shl_flag == false) {
-    if (shl_flag == false) {
-      shl = search_hl;
-      shl_flag = true;
-    } else {
-      shl = &cur->mit_hl;
-    }
-    if (shl->rm.regprog != NULL
-        && shl->lnum == 0
-        && re_multiline(shl->rm.regprog)) {
-      if (shl->first_lnum == 0) {
-        for (shl->first_lnum = lnum;
-             shl->first_lnum > wp->w_topline;
-             shl->first_lnum--) {
-          if (hasFolding(wp, shl->first_lnum - 1, NULL, NULL)) {
-            break;
-          }
-        }
-      }
-      if (cur != NULL) {
-        cur->mit_pos_cur = 0;
-      }
-      bool pos_inprogress = true;  // mark that a position match search is
-                                   // in progress
-      int n = 0;
-      while (shl->first_lnum < lnum && (shl->rm.regprog != NULL
-                                        || (cur != NULL && pos_inprogress))) {
-        next_search_hl(wp, search_hl, shl, shl->first_lnum, (colnr_T)n,
-                       shl == search_hl ? NULL : cur);
-        pos_inprogress = !(cur == NULL || cur->mit_pos_cur == 0);
-        if (shl->lnum != 0) {
-          shl->first_lnum = shl->lnum
-                            + shl->rm.endpos[0].lnum
-                            - shl->rm.startpos[0].lnum;
-          n = shl->rm.endpos[0].col;
-        } else {
-          shl->first_lnum++;
-          n = 0;
+  if (shl->rm.regprog != NULL
+      && shl->lnum == 0
+      && re_multiline(shl->rm.regprog)) {
+    if (shl->first_lnum == 0) {
+      for (shl->first_lnum = lnum;
+           shl->first_lnum > wp->w_topline;
+           shl->first_lnum--) {
+        if (hasFolding(wp, shl->first_lnum - 1, NULL, NULL)) {
+          break;
         }
       }
     }
-    if (shl != search_hl && cur != NULL) {
-      cur = cur->mit_next;
+    int n = 0;
+    while (shl->first_lnum < lnum && shl->rm.regprog != NULL) {
+      next_search_hl(wp, shl, shl->first_lnum, (colnr_T)n);
+      if (shl->lnum != 0) {
+        shl->first_lnum = shl->lnum
+                          + shl->rm.endpos[0].lnum
+                          - shl->rm.startpos[0].lnum;
+        n = shl->rm.endpos[0].col;
+      } else {
+        shl->first_lnum++;
+        n = 0;
+      }
     }
   }
 }
@@ -558,85 +454,59 @@ static void check_cur_search_hl(win_T *wp, match_T *shl)
   }
 }
 
-/// Prepare for 'hlsearch' and match highlighting in one window line.
+/// Prepare for 'hlsearch' highlighting in one window line.
 ///
 /// @return  true if there is such highlighting and set "search_attr" to the
 ///          current highlight attribute.
 bool prepare_search_hl_line(win_T *wp, linenr_T lnum, colnr_T mincol, char **line,
-                            match_T *search_hl, int *search_attr, bool *search_attr_from_match)
+                            match_T *search_hl, int *search_attr)
 {
-  matchitem_T *cur = wp->w_match_head;  // points to the match list
-  match_T *shl;                     // points to search_hl or a match
-  bool shl_flag = false;        // flag to indicate whether search_hl
-                                // has been processed or not
+  // Only handle hlsearch. matchadd() is handled by match_fill_line_extmarks().
+  match_T *shl = search_hl;
   bool area_highlighting = false;
 
-  // Handle highlighting the last used search pattern and matches.
-  // Do this for both search_hl and the match list.
-  while (cur != NULL || !shl_flag) {
-    if (!shl_flag) {
-      shl = search_hl;
-      shl_flag = true;
+  shl->startcol = MAXCOL;
+  shl->endcol = MAXCOL;
+  shl->attr_cur = 0;
+  shl->is_addpos = false;
+  shl->has_cursor = false;
+  next_search_hl(wp, shl, lnum, mincol);
+
+  // Need to get the line again, a multi-line regexp may have made it invalid.
+  *line = ml_get_buf(wp->w_buffer, lnum);
+
+  if (shl->lnum != 0 && shl->lnum <= lnum) {
+    if (shl->lnum == lnum) {
+      shl->startcol = shl->rm.startpos[0].col;
     } else {
-      shl = &cur->mit_hl;
+      shl->startcol = 0;
     }
-    shl->startcol = MAXCOL;
-    shl->endcol = MAXCOL;
-    shl->attr_cur = 0;
-    shl->is_addpos = false;
-    shl->has_cursor = false;
-    if (cur != NULL) {
-      cur->mit_pos_cur = 0;
+    if (lnum == shl->lnum + shl->rm.endpos[0].lnum - shl->rm.startpos[0].lnum) {
+      shl->endcol = shl->rm.endpos[0].col;
+    } else {
+      shl->endcol = MAXCOL;
     }
-    next_search_hl(wp, search_hl, shl, lnum, mincol,
-                   shl == search_hl ? NULL : cur);
 
-    // Need to get the line again, a multi-line regexp may have made it
-    // invalid.
-    *line = ml_get_buf(wp->w_buffer, lnum);
+    check_cur_search_hl(wp, shl);
 
-    if (shl->lnum != 0 && shl->lnum <= lnum) {
-      if (shl->lnum == lnum) {
-        shl->startcol = shl->rm.startpos[0].col;
+    // Highlight one character for an empty match.
+    if (shl->startcol == shl->endcol) {
+      if ((*line)[shl->endcol] != NUL) {
+        shl->endcol += utfc_ptr2len(*line + shl->endcol);
       } else {
-        shl->startcol = 0;
+        shl->endcol++;
       }
-      if (lnum == shl->lnum + shl->rm.endpos[0].lnum
-          - shl->rm.startpos[0].lnum) {
-        shl->endcol = shl->rm.endpos[0].col;
-      } else {
-        shl->endcol = MAXCOL;
-      }
-
-      // check if the cursor is in the match before changing the columns
-      if (shl == search_hl) {
-        check_cur_search_hl(wp, shl);
-      }
-
-      // Highlight one character for an empty match.
-      if (shl->startcol == shl->endcol) {
-        if ((*line)[shl->endcol] != NUL) {
-          shl->endcol += utfc_ptr2len(*line + shl->endcol);
-        } else {
-          shl->endcol++;
-        }
-      }
-      if (shl->startcol < mincol) {   // match at leftcol
-        shl->attr_cur = shl->attr;
-        *search_attr = shl->attr;
-        *search_attr_from_match = shl != search_hl;
-      }
-      area_highlighting = true;
     }
-    if (shl != search_hl && cur != NULL) {
-      cur = cur->mit_next;
+    if (shl->startcol < mincol) {  // match at leftcol
+      shl->attr_cur = shl->attr;
+      *search_attr = shl->attr;
     }
+    area_highlighting = true;
   }
   return area_highlighting;
 }
 
-/// For a position in a line: Check for start/end of 'hlsearch' and other
-/// matches.
+/// For a position in a line: Check for start/end of 'hlsearch'.
 /// After end, check for start/end of next match.
 /// When another match, have to check for start again.
 /// Watch out for matching an empty string!
@@ -644,128 +514,68 @@ bool prepare_search_hl_line(win_T *wp, linenr_T lnum, colnr_T mincol, char **lin
 /// is endcol.
 /// Return the updated search_attr.
 int update_search_hl(win_T *wp, linenr_T lnum, colnr_T col, char **line, match_T *search_hl,
-                     int *has_match_conc, int *match_conc, bool lcs_eol_todo, bool *on_last_col,
-                     bool *search_attr_from_match)
+                     bool lcs_eol_todo, bool *on_last_col)
 {
-  matchitem_T *cur = wp->w_match_head;  // points to the match list
-  match_T *shl;                     // points to search_hl or a match
-  bool shl_flag = false;        // flag to indicate whether search_hl
-                                // has been processed or not
+  // Only handle hlsearch. matchadd() highlights are in DecorState.
+  match_T *shl = search_hl;
   int search_attr = 0;
 
-  // Do this for 'search_hl' and the match list (ordered by priority).
-  while (cur != NULL || !shl_flag) {
-    if (!shl_flag
-        && (cur == NULL || cur->mit_priority > SEARCH_HL_PRIORITY)) {
-      shl = search_hl;
-      shl_flag = true;
-    } else {
-      shl = &cur->mit_hl;
-    }
-    if (cur != NULL) {
-      cur->mit_pos_cur = 0;
-    }
-    bool pos_inprogress = true;  // mark that a position match search is
-                                 // in progress
-    while (shl->rm.regprog != NULL
-           || (cur != NULL && pos_inprogress)) {
-      if (shl->startcol != MAXCOL
-          && col >= shl->startcol
-          && col < shl->endcol) {
-        int next_col = col + utfc_ptr2len(*line + col);
+  while (shl->rm.regprog != NULL) {
+    if (shl->startcol != MAXCOL
+        && col >= shl->startcol
+        && col < shl->endcol) {
+      int next_col = col + utfc_ptr2len(*line + col);
 
-        if (shl->endcol < next_col) {
-          shl->endcol = next_col;
-        }
-        // Highlight the match were the cursor is using the CurSearch
-        // group.
-        if (shl == search_hl && shl->has_cursor) {
-          shl->attr_cur = win_hl_attr(wp, HLF_LC);
-          if (shl->attr_cur != shl->attr) {
-            search_hl_has_cursor_lnum = lnum;
-          }
-        } else {
-          shl->attr_cur = shl->attr;
-        }
-        // Match with the "Conceal" group results in hiding
-        // the match.
-        if (cur != NULL
-            && shl != search_hl
-            && syn_name2id("Conceal") == cur->mit_hlg_id) {
-          *has_match_conc = col == shl->startcol ? 2 : 1;
-          *match_conc = cur->mit_conceal_char;
-        } else {
-          *has_match_conc = 0;
-        }
-      } else if (col == shl->endcol) {
-        shl->attr_cur = 0;
-
-        next_search_hl(wp, search_hl, shl, lnum, col,
-                       shl == search_hl ? NULL : cur);
-        pos_inprogress = !(cur == NULL || cur->mit_pos_cur == 0);
-
-        // Need to get the line again, a multi-line regexp
-        // may have made it invalid.
-        *line = ml_get_buf(wp->w_buffer, lnum);
-
-        if (shl->lnum == lnum) {
-          shl->startcol = shl->rm.startpos[0].col;
-          if (shl->rm.endpos[0].lnum == 0) {
-            shl->endcol = shl->rm.endpos[0].col;
-          } else {
-            shl->endcol = MAXCOL;
-          }
-
-          // check if the cursor is in the match
-          if (shl == search_hl) {
-            check_cur_search_hl(wp, shl);
-          }
-
-          if (shl->startcol == shl->endcol) {
-            // highlight empty match, try again after it
-            char *p = *line + shl->endcol;
-
-            if (*p == NUL) {
-              shl->endcol++;
-            } else {
-              shl->endcol += utfc_ptr2len(p);
-            }
-          }
-
-          // Loop to check if the match starts at the
-          // current position
-          continue;
-        }
+      if (shl->endcol < next_col) {
+        shl->endcol = next_col;
       }
-      break;
+      // Highlight the match where the cursor is using the CurSearch group.
+      if (shl->has_cursor) {
+        shl->attr_cur = win_hl_attr(wp, HLF_LC);
+        if (shl->attr_cur != shl->attr) {
+          search_hl_has_cursor_lnum = lnum;
+        }
+      } else {
+        shl->attr_cur = shl->attr;
+      }
+    } else if (col == shl->endcol) {
+      shl->attr_cur = 0;
+
+      next_search_hl(wp, shl, lnum, col);
+
+      // Need to get the line again, a multi-line regexp may have made it invalid.
+      *line = ml_get_buf(wp->w_buffer, lnum);
+
+      if (shl->lnum == lnum) {
+        shl->startcol = shl->rm.startpos[0].col;
+        if (shl->rm.endpos[0].lnum == 0) {
+          shl->endcol = shl->rm.endpos[0].col;
+        } else {
+          shl->endcol = MAXCOL;
+        }
+
+        check_cur_search_hl(wp, shl);
+
+        if (shl->startcol == shl->endcol) {
+          // highlight empty match, try again after it
+          char *p = *line + shl->endcol;
+          if (*p == NUL) {
+            shl->endcol++;
+          } else {
+            shl->endcol += utfc_ptr2len(p);
+          }
+        }
+
+        // Loop to check if the match starts at the current position.
+        continue;
+      }
     }
-    if (shl != search_hl && cur != NULL) {
-      cur = cur->mit_next;
-    }
+    break;
   }
 
-  // Use attributes from match with highest priority among 'search_hl' and
-  // the match list.
-  *search_attr_from_match = false;
-  search_attr = search_hl->attr_cur;
-  cur = wp->w_match_head;
-  shl_flag = false;
-  while (cur != NULL || !shl_flag) {
-    if (!shl_flag
-        && (cur == NULL || cur->mit_priority > SEARCH_HL_PRIORITY)) {
-      shl = search_hl;
-      shl_flag = true;
-    } else {
-      shl = &cur->mit_hl;
-    }
-    if (shl->attr_cur != 0) {
-      search_attr = shl->attr_cur;
-      *on_last_col = col + 1 >= shl->endcol;
-      *search_attr_from_match = shl != search_hl;
-    }
-    if (shl != search_hl && cur != NULL) {
-      cur = cur->mit_next;
-    }
+  search_attr = shl->attr_cur;
+  if (search_attr != 0) {
+    *on_last_col = col + 1 >= shl->endcol;
   }
   // Only highlight one character after the last column.
   if (*(*line + col) == NUL && (wp->w_p_list && !lcs_eol_todo)) {
@@ -783,51 +593,32 @@ bool get_prevcol_hl_flag(win_T *wp, match_T *search_hl, colnr_T curcol)
     prevcol++;
   }
 
-  // Highlight a character after the end of the line if the match started
-  // at the end of the line or when the match continues in the next line
-  // (match includes the line break).
-  if (!search_hl->is_addpos && (prevcol == search_hl->startcol
-                                || (prevcol > search_hl->startcol
-                                    && search_hl->endcol == MAXCOL))) {
+  // hlsearch: highlight char after EOL if match started/continues there.
+  if (prevcol == search_hl->startcol
+      || (prevcol > search_hl->startcol && search_hl->endcol == MAXCOL)) {
     return true;
   }
-  matchitem_T *cur = wp->w_match_head;  // points to the match list
-  while (cur != NULL) {
-    if (!cur->mit_hl.is_addpos && (prevcol == cur->mit_hl.startcol
-                                   || (prevcol > cur->mit_hl.startcol
-                                       && cur->mit_hl.endcol == MAXCOL))) {
+
+  // matchadd() multi-line ranges use end_col=MAXCOL and remain in
+  // current_end through decor_redraw_col(col=NUL).  Any such range means
+  // we need to highlight the EOL cell.
+  int *const indices = decor_state.ranges_i.items;
+  DecorRangeSlot *const slots = decor_state.slots.items;
+  for (int i = 0; i < decor_state.current_end; i++) {
+    if (slots[indices[i]].range.end_col == MAXCOL) {
       return true;
     }
-    cur = cur->mit_next;
   }
 
   return false;
 }
 
-/// Get highlighting for the char after the text in "char_attr" from 'hlsearch'
-/// or match highlighting.
+/// Get highlighting for the char after the text in "char_attr" from 'hlsearch'.
 void get_search_match_hl(win_T *wp, match_T *search_hl, colnr_T col, int *char_attr)
 {
-  matchitem_T *cur = wp->w_match_head;  // points to the match list
-  match_T *shl;                     // points to search_hl or a match
-  bool shl_flag = false;        // flag to indicate whether search_hl
-                                // has been processed or not
-
-  while (cur != NULL || !shl_flag) {
-    if (!shl_flag
-        && (cur == NULL || cur->mit_priority > SEARCH_HL_PRIORITY)) {
-      shl = search_hl;
-      shl_flag = true;
-    } else {
-      shl = &cur->mit_hl;
-    }
-    if (col - 1 == shl->startcol
-        && (shl == search_hl || !shl->is_addpos)) {
-      *char_attr = shl->attr;
-    }
-    if (shl != search_hl && cur != NULL) {
-      cur = cur->mit_next;
-    }
+  // hlsearch only. matchadd() highlights are in DecorState.
+  if (col - 1 == search_hl->startcol) {
+    *char_attr = search_hl->attr;
   }
 }
 
@@ -1208,4 +999,211 @@ void ex_match(exarg_T *eap)
     }
   }
   eap->nextcmd = find_nextcmd(end);
+}
+
+/// Add a single highlight decoration range to DecorState for the current line.
+static void match_add_decor(int row, colnr_T start_col, colnr_T end_col,
+                            DecorHighlightInline *hl_base)
+{
+  DecorSignHighlight sh = decor_sh_from_inline(*hl_base);
+  decor_range_add_sh(&decor_state, row, start_col, row, end_col,
+                     &sh, true, 0, 0, 0);
+}
+
+/// For multi-line regex patterns, find matches that started on a line before
+/// `lnum` and extend into it, injecting the visible portion into DecorState.
+/// Mirrors the old prepare_search_hl() prescan loop for matchadd items.
+static void match_prescan_multiline(win_T *wp, matchitem_T *cur, linenr_T lnum,
+                                    int row, DecorHighlightInline *hl_base)
+{
+  buf_T *buf = wp->w_buffer;
+
+  // Initialise first_lnum once per redraw: walk backward from lnum to
+  // w_topline, stopping just after a closed fold.
+  if (cur->mit_ml_first_lnum == 0) {
+    cur->mit_ml_first_lnum = lnum;
+    for (; cur->mit_ml_first_lnum > wp->w_topline; cur->mit_ml_first_lnum--) {
+      if (hasFolding(wp, cur->mit_ml_first_lnum - 1, NULL, NULL)) {
+        break;
+      }
+    }
+  }
+
+  colnr_T n = 0;
+  linenr_T scan_lnum = cur->mit_ml_first_lnum;
+
+  while (scan_lnum < lnum) {
+    if (profile_passed_limit(cur->mit_ml_tm)) {
+      break;
+    }
+    // Re-sync regprog: vim_regexec_multi() may recompile it internally.
+    cur->mit_ml_rm.regprog = cur->mit_match.regprog;
+
+    int timed_out = false;
+    int nmatched = vim_regexec_multi(&cur->mit_ml_rm, wp, buf,
+                                     scan_lnum, n, &cur->mit_ml_tm, &timed_out);
+    cur->mit_match.regprog = cur->mit_ml_rm.regprog;
+
+    // Clear got_int: don't show "Type :quit" from a regexp error in redraw.
+    if (got_int || timed_out) {
+      got_int = false;
+      break;
+    }
+    if (nmatched == 0) {
+      scan_lnum++;
+      n = 0;
+      continue;
+    }
+
+    linenr_T match_start = scan_lnum + cur->mit_ml_rm.startpos[0].lnum;
+    linenr_T match_end   = scan_lnum + cur->mit_ml_rm.endpos[0].lnum;
+
+    if (match_end >= lnum && match_start <= lnum) {
+      colnr_T s_col = (match_start < lnum) ? 0 : cur->mit_ml_rm.startpos[0].col;
+      // Use MAXCOL when match continues past lnum: keeps range alive through
+      // decor_redraw_col(col=NUL), so get_prevcol_hl_flag() can find it.
+      colnr_T e_col = (match_end > lnum) ? MAXCOL : cur->mit_ml_rm.endpos[0].col;
+      if (s_col < e_col) {
+        match_add_decor(row, s_col, e_col, hl_base);
+      }
+      // Leave first_lnum at scan_lnum so the next call (for lnum+1, lnum+2…)
+      // re-executes the regex from here and re-discovers the same match,
+      // injecting the correct column range for each successive covered line.
+      cur->mit_ml_first_lnum = scan_lnum;
+      return;
+    }
+
+    // Match entirely before lnum: advance past it.
+    scan_lnum = match_end;
+    n = cur->mit_ml_rm.endpos[0].col;
+    // Guard against empty match causing infinite loop.
+    if (cur->mit_ml_rm.endpos[0].lnum == cur->mit_ml_rm.startpos[0].lnum
+        && n == cur->mit_ml_rm.startpos[0].col) {
+      char *ml = ml_get_buf(buf, scan_lnum);
+      if (ml[n] == NUL) {
+        scan_lnum++;
+        n = 0;
+      } else {
+        n += utfc_ptr2len(ml + n);
+      }
+    }
+  }
+  cur->mit_ml_first_lnum = scan_lnum;
+}
+
+/// Inject matchadd()/matchaddpos() highlights for `lnum` into DecorState as
+/// ephemeral ranges.  Called once per line from win_line(), after
+/// decor_redraw_line() and before the main character loop.
+void match_fill_line_extmarks(win_T *wp, linenr_T lnum)
+{
+  buf_T *buf = wp->w_buffer;
+  int row = (int)lnum - 1;
+  int conceal_hlg_id = syn_name2id("Conceal");
+
+  for (matchitem_T *cur = wp->w_match_head; cur != NULL; cur = cur->mit_next) {
+    if (cur->mit_hlg_id == 0) {
+      continue;
+    }
+
+    DecorHighlightInline hl_base = DECOR_HIGHLIGHT_INLINE_INIT;
+    hl_base.hl_id = cur->mit_hlg_id;
+    hl_base.priority = (DecorPriority)cur->mit_priority;
+
+    if (cur->mit_conceal_char != 0) {
+      hl_base.conceal_char = schar_from_char(cur->mit_conceal_char);
+      hl_base.flags |= kSHConceal;
+    } else if (cur->mit_hlg_id == conceal_hlg_id) {
+      // matchadd('Conceal', pat) without replacement char still conceals.
+      hl_base.flags |= kSHConceal;
+    }
+
+    if (cur->mit_match.regprog != NULL) {
+      // --- matchadd() regex branch ---
+      if (re_multiline(cur->mit_match.regprog)) {
+        match_prescan_multiline(wp, cur, lnum, row, &hl_base);
+      }
+
+      regmmatch_T regmatch = cur->mit_match;
+      colnr_T matchcol = 0;
+      proftime_T tm = profile_setlimit(p_rdt);
+
+      while (true) {
+        if (profile_passed_limit(tm)) {
+          break;
+        }
+        int timed_out = false;
+        int nmatched = vim_regexec_multi(&regmatch, wp, buf, lnum, matchcol,
+                                         &tm, &timed_out);
+        cur->mit_match.regprog = regmatch.regprog;
+        if (nmatched == 0 || timed_out || got_int) {
+          got_int = false;
+          break;
+        }
+        if (regmatch.startpos[0].lnum > 0) {
+          break;  // match starts on a later line
+        }
+
+        colnr_T start_col = regmatch.startpos[0].col;
+        // Use MAXCOL for multi-line match: keeps range alive at NUL position
+        // so decor_redraw_col contributes the attr to wlv.char_attr, and
+        // get_prevcol_hl_flag() finds it in current_end.
+        colnr_T end_col = (regmatch.endpos[0].lnum == 0)
+                          ? regmatch.endpos[0].col : MAXCOL;
+
+        // Empty match: highlight one character.
+        if (start_col == end_col) {
+          char *ml = ml_get_buf(buf, lnum);
+          if (ml[end_col] != NUL) {
+            end_col += utfc_ptr2len(ml + end_col);
+          } else {
+            end_col = MAXCOL;
+          }
+        }
+
+        match_add_decor(row, start_col, end_col, &hl_base);
+
+        if (end_col == MAXCOL) {
+          break;  // highlighted to EOL; no further matches on this line
+        }
+        matchcol = regmatch.endpos[0].col;
+        // Guard against zero-width match causing infinite loop.
+        if (matchcol == regmatch.startpos[0].col) {
+          char *ml = ml_get_buf(buf, lnum);
+          if (ml[matchcol] == NUL) {
+            break;
+          }
+          matchcol += utfc_ptr2len(ml + matchcol);
+        }
+      }
+    } else {
+      // --- matchaddpos() position list branch ---
+      char *ml = ml_get_buf(buf, lnum);
+      int line_len = (int)strlen(ml);
+
+      for (int j = 0; j < cur->mit_pos_count; j++) {
+        llpos_T *pos = &cur->mit_pos_array[j];
+        if (pos->lnum == 0) {
+          break;
+        }
+        if (pos->lnum != lnum) {
+          continue;
+        }
+        colnr_T start_col, end_col;
+        if (pos->col == 0) {
+          start_col = 0;
+          end_col = line_len;
+        } else {
+          start_col = pos->col - 1;
+          if (start_col >= line_len) {
+            continue;
+          }
+          end_col = start_col + MAX(pos->len, 1);
+          if (end_col > line_len) {
+            end_col = line_len;
+          }
+        }
+        match_add_decor(row, start_col, end_col, &hl_base);
+      }
+    }
+  }
 }

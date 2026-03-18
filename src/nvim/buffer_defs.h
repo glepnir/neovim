@@ -947,6 +947,12 @@ struct matchitem {
   match_T mit_hl;          ///< struct for doing the actual highlighting
   int mit_hlg_id;          ///< highlight group ID
   int mit_conceal_char;    ///< cchar for Conceal highlighting
+
+  // Multi-line regex prescan state for match_fill_line_extmarks().
+  // Mirrors the old shl->first_lnum logic from prepare_search_hl().
+  linenr_T mit_ml_first_lnum;  ///< first line to scan from (0 = not initialised)
+  regmmatch_T mit_ml_rm;       ///< regex match state (shared regprog, never freed here)
+  proftime_T mit_ml_tm;        ///< timeout for prescan
 };
 
 typedef int FloatAnchor;
