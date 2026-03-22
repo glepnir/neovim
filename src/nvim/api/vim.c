@@ -2518,3 +2518,36 @@ void nvim__redraw(Dict(redraw) *opts, Error *err)
   RedrawingDisabled = save_rd;
   p_lz = save_lz;
 }
+
+/// Start a completion session. Returns a ticket for state synchronization.
+/// Subsequent calls to nvim__compl_add must pass this ticket.
+///
+/// @param startcol  0-based byte column where completed text starts.
+/// @param[out] err  Error details.
+/// @return ticket   Session ticket, or -1 on error.
+Integer nvim__compl_start(Integer startcol, Error *err)
+{
+  if ((State & MODE_INSERT) == 0) {
+    api_set_error(err, kErrorTypeException, "must be in Insert mode");
+    return -1;
+  }
+  VALIDATE_INT(startcol >= 0, "startcol", startcol, { return -1; });
+
+  return ins_compl_start_session((colnr_T)startcol);
+}
+
+/// Add completion items to the current session.
+///
+/// @param opts  Dict with keys:
+///   - ticket (Integer):     Session ticket.
+///   - items (Array):        Strings or complete-item Dicts.
+///   - source_idx (Integer): Optional. Per-source index. Default -1.
+///   - startcol (Integer):   Optional. Start column. Default -3.
+/// @param[out] err Error details.
+/// @return true if items were added.
+Boolean nvim__compl_add(Dict(compl_add) *opts, Error *err)
+{
+  int64_t source_idx = HAS_KEY(opts, compl_add, source_idx) ? opts->source_idx : -1;
+  int64_t startcol = HAS_KEY(opts, compl_add, startcol) ? opts->startcol : -3;
+  return ins_compl_add_items(opts->ticket, source_idx, startcol, &opts->items);
+}

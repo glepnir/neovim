@@ -484,3 +484,19 @@ typedef struct {
   Integer c;
   String f;
 } Dict(_shada_buflist_item);
+
+typedef struct {
+  OptionalKeys is_set__complete_show_;
+  Integer col;
+  Array items;
+  Integer selected;
+  Integer total;
+} Dict(complete_show);
+
+typedef struct {
+  OptionalKeys is_set__compl_add_;
+  Integer ticket;
+  Array items;
+  Integer source_idx;
+  Integer startcol;
+} Dict(compl_add);

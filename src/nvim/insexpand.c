@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "klib/kvec.h"
+#include "nvim/api/private/converter.h"
 #include "nvim/api/private/helpers.h"
 #include "nvim/ascii_defs.h"
 #include "nvim/autocmd.h"
@@ -295,6 +296,8 @@ static uint64_t compl_timeout_ms = COMPL_INITIAL_TIMEOUT_MS;
 static bool compl_time_slice_expired = false;  ///< time budget exceeded for current source
 static bool compl_from_nonkeyword = false;     ///< completion started from non-keyword
 static bool compl_hi_on_autocompl_longest = false;  ///< apply "PreInsert" highlight
+
+static int64_t compl_ticket = 0;
 
 // Halve the current completion timeout, simulating exponential decay.
 #define COMPL_MIN_TIMEOUT_MS    5
@@ -1735,6 +1738,14 @@ void ins_compl_show_pum(void)
   pum_display(compl_match_array, compl_match_arraysize, cur, array_changed, 0);
   curwin->w_cursor.col = col;
 
+  // Lock PUM dimensions after the first successful display in a session.
+  // Subsequent rebuilds (async source delivery, leader changes) reuse
+  // these dimensions, giving the user a visually stable popup: contents
+  // update in place, a scrollbar appears if the list outgrows the
+  // locked height, and long items get truncated rather than widening
+  // the popup.  Unlocked in ins_compl_stop / ins_compl_clear.
+  pum_lock_dimensions();
+
   // After adding leader, set the current match to shown match.
   if (compl_started && compl_curr_match != compl_shown_match) {
     compl_curr_match = compl_shown_match;
@@ -2053,7 +2064,17 @@ static void ins_compl_item_free(compl_T *match)
   xfree(match);
 }
 
-/// Free the list of completions
+/// Free the list of completions.
+///
+/// NOTE: this is called from two kinds of context:
+///   1. Real session end (ins_compl_stop / ins_compl_clear).  Those
+///      callers do compl_ticket++ and notify Lua BEFORE invoking us.
+///   2. Intra-session rebuild (ins_compl_restart, triggered by BS-past-
+///      boundary or refresh='always' user functions).  The user is
+///      still in completion mode; in-flight async work must NOT be
+///      cancelled here — the new collection phase will re-use live
+///      state.  That's why ticket++ is at the session-end sites,
+///      not inside this function.
 static void ins_compl_free(void)
 {
   API_CLEAR_STRING(compl_pattern);
@@ -2080,6 +2101,29 @@ static void ins_compl_free(void)
 /// Reset/clear the completion state.
 void ins_compl_clear(void)
 {
+  // Defensive: if clear is entered while a session was still live
+  // (e.g. hard reset path that bypasses ins_compl_stop), invalidate
+  // in-flight async work.  In the normal accept/cancel flow
+  // ins_compl_stop has already done this before we get here, so the
+  // extra ticket bump just makes the subsequent ticket increment a
+  // no-op for Lua — no harm, no extra notify (old_ticket check below
+  // skips already-notified sessions via the `compl_started` guard).
+  if (compl_started) {
+    pum_unlock_dimensions();
+    int64_t old_ticket = compl_ticket;
+    compl_ticket++;
+    Array args = ARRAY_DICT_INIT;
+    ADD(args, INTEGER_OBJ(old_ticket));
+    Error err = ERROR_INIT;
+    NLUA_EXEC_STATIC(
+      "require('vim._core.completion')._on_session_end(...)",
+      args, kRetNilBool, NULL, &err);
+    api_free_array(args);
+    if (ERROR_SET(&err)) {
+      api_clear_error(&err);
+    }
+  }
+
   compl_cont_status = 0;
   compl_started = false;
   compl_matches = 0;
@@ -2106,6 +2150,11 @@ bool ins_compl_active(void)
   FUNC_ATTR_PURE
 {
   return compl_started;
+}
+
+void ins_compl_set_status(bool started)
+{
+  compl_started = started;
 }
 
 /// Return true when wp is the actual completion window
@@ -2686,6 +2735,28 @@ static bool ins_compl_stop(const int c, const int prev_mode, bool retval)
   // ctrl_x_mode, so that complete_info() can be used.
   ctrl_x_mode = prev_mode;
   ins_apply_autocmds(EVENT_COMPLETEDONEPRE);
+
+  // Session is ending for real (accept / C-E / mode change / etc).
+  // Invalidate in-flight async source work and unlock PUM dimensions
+  // before freeing the match list.  Ticket bump alone guarantees
+  // correctness (late deliveries fail the ticket check); the notify
+  // is a cooperative hint for Lua to stop wasted work (cancel LSP
+  // requests, stop timers, etc.).
+  pum_unlock_dimensions();
+  int64_t old_ticket = compl_ticket;
+  compl_ticket++;
+  if (old_ticket != 0) {
+    Array args = ARRAY_DICT_INIT;
+    ADD(args, INTEGER_OBJ(old_ticket));
+    Error notify_err = ERROR_INIT;
+    NLUA_EXEC_STATIC(
+      "require('vim._core.completion')._on_session_end(...)",
+      args, kRetNilBool, NULL, &notify_err);
+    api_free_array(args);
+    if (ERROR_SET(&notify_err)) {
+      api_clear_error(&notify_err);  // swallow — we're in cleanup
+    }
+  }
 
   ins_compl_free();
   compl_started = false;
@@ -4686,199 +4757,28 @@ static int advance_cpt_sources_index_safe(void)
 /// Return the total number of matches or -1 if still unknown -- Acevedo
 static int ins_compl_get_exp(pos_T *ini)
 {
-  static ins_compl_next_state_T st;
-  static bool st_cleared = false;
-  int found_new_match;
-  int type = ctrl_x_mode;
-  bool may_advance_cpt_idx = false;
-  pos_T start_pos = *ini;
-
-  assert(curbuf != NULL);
-
-  if (!compl_started) {
-    FOR_ALL_BUFFERS(buf) {
-      buf->b_scanned = false;
-    }
-    if (!st_cleared) {
-      CLEAR_FIELD(st);
-      st_cleared = true;
-    }
-    st.found_all = false;
-    st.ins_buf = curbuf;
-    xfree(st.e_cpt_copy);
-    // Make a copy of 'complete', in case the buffer is wiped out.
-    st.e_cpt_copy = xstrdup((compl_cont_status & CONT_LOCAL) ? "." : curbuf->b_p_cpt);
-    strip_caret_numbers_in_place(st.e_cpt_copy);
-    st.e_cpt = st.e_cpt_copy;
-
-    // In large buffers, timeout may miss nearby matches — search above cursor
-#define LOOKBACK_LINE_COUNT     1000
-    if (compl_autocomplete && is_nearest_active()) {
-      start_pos.lnum = MAX(1, start_pos.lnum - LOOKBACK_LINE_COUNT);
-      start_pos.col = 0;
-    }
-    st.last_match_pos = st.first_match_pos = start_pos;
-  } else if (st.ins_buf != curbuf && !buf_valid(st.ins_buf)) {
-    st.ins_buf = curbuf;  // In case the buffer was wiped out.
-  }
-  assert(st.ins_buf != NULL);
-
-  compl_old_match = compl_curr_match;   // remember the last current match
-  st.cur_match_pos = compl_dir_forward() ? &st.last_match_pos : &st.first_match_pos;
-
-  bool normal_mode_strict = ctrl_x_mode_normal() && !ctrl_x_mode_line_or_eval()
-                            && !(compl_cont_status & CONT_LOCAL)
-                            && cpt_sources_array != NULL;
-  if (normal_mode_strict) {
-    cpt_sources_index = 0;
-    if (compl_autocomplete || p_cto > 0) {
-      compl_source_start_timer(0);
-      compl_time_slice_expired = false;
-      compl_timeout_ms = compl_autocomplete
-                         ? (uint64_t)MAX(COMPL_INITIAL_TIMEOUT_MS, p_act)
-                         : (uint64_t)p_cto;
-    }
-  }
-
-  // For ^N/^P loop over all the flags/windows/buffers in 'complete'
-  while (true) {
-    found_new_match = FAIL;
-    st.set_match_pos = false;
-
-    // For ^N/^P pick a new entry from e_cpt if compl_started is off,
-    // or if found_all says this entry is done.  For ^X^L only use the
-    // entries from 'complete' that look in loaded buffers.
-    if ((ctrl_x_mode_normal() || ctrl_x_mode_line_or_eval())
-        && (!compl_started || st.found_all)) {
-      int status = process_next_cpt_value(&st, &type, &start_pos,
-                                          cot_fuzzy(), &may_advance_cpt_idx);
-      if (status == INS_COMPL_CPT_END) {
-        break;
-      }
-      if (status == INS_COMPL_CPT_CONT) {
-        if (may_advance_cpt_idx) {
-          if (!advance_cpt_sources_index_safe()) {
-            break;
-          }
-          compl_source_start_timer(cpt_sources_index);
-        }
-        continue;
-      }
-    }
-
-    uint64_t compl_timeout_save = 0;
-    if (normal_mode_strict && type == CTRL_X_FUNCTION
-        && (compl_autocomplete || p_cto > 0)) {
-      // LSP servers may sporadically take >1s to respond (e.g., while
-      // loading modules), but other sources might already have matches.
-      // To show results quickly use a short timeout for keyword
-      // completion. Allow longer timeout for non-keyword completion
-      // where only function based sources (e.g. LSP) are active.
-      compl_timeout_save = compl_timeout_ms;
-      compl_timeout_ms = compl_from_nonkeyword
-                         ? COMPL_FUNC_TIMEOUT_NON_KW_MS : COMPL_FUNC_TIMEOUT_MS;
-    }
-
-    // get the next set of completion matches
-    found_new_match = get_next_completion_match(type, &st, &start_pos);
-
-    // If complete() was called then compl_pattern has been reset.
-    // The following won't work then, bail out.
-    if (compl_pattern.data == NULL) {
-      break;
-    }
-
-    if (may_advance_cpt_idx) {
-      if (!advance_cpt_sources_index_safe()) {
-        break;
-      }
-      compl_source_start_timer(cpt_sources_index);
-    }
-
-    // break the loop for specialized modes (use 'complete' just for the
-    // generic ctrl_x_mode == CTRL_X_NORMAL) or when we've found a new match
-    if ((ctrl_x_mode_not_default() && !ctrl_x_mode_line_or_eval())
-        || found_new_match != FAIL) {
-      if (got_int) {
-        break;
-      }
-      // Fill the popup menu as soon as possible.
-      if (type != -1) {
-        ins_compl_check_keys(0, false);
-      }
-
-      if ((ctrl_x_mode_not_default() && !ctrl_x_mode_line_or_eval())
-          || compl_interrupted) {
-        break;
-      }
-      compl_started = !compl_time_slice_expired;
-    } else {
-      // Mark a buffer scanned when it has been scanned completely
-      if (buf_valid(st.ins_buf) && (type == 0 || type == CTRL_X_PATH_PATTERNS)) {
-        assert(st.ins_buf);
-        st.ins_buf->b_scanned = true;
-      }
-
-      compl_started = false;
-    }
-
-    // Restore the timeout after collecting matches from function source
-    if (normal_mode_strict && type == CTRL_X_FUNCTION
-        && (compl_autocomplete || p_cto > 0)) {
-      compl_timeout_ms = compl_timeout_save;
-    }
-
-    // For `^P` completion, reset `compl_curr_match` to the head to avoid
-    // mixing matches from different sources.
-    if (!compl_dir_forward()) {
-      while (compl_curr_match->cp_prev
-             && !match_at_original_text(compl_curr_match->cp_prev)) {
-        compl_curr_match = compl_curr_match->cp_prev;
-      }
-    }
-  }
-  cpt_sources_index = -1;
+  compl_ticket++;
+  compl_old_match = compl_curr_match;
   compl_started = true;
 
-  if ((ctrl_x_mode_normal() || ctrl_x_mode_line_or_eval())
-      && *st.e_cpt == NUL) {  // Got to end of 'complete'
-    found_new_match = FAIL;
+  Array args = ARRAY_DICT_INIT;
+  ADD(args, CSTR_TO_OBJ(compl_pattern.data ? compl_pattern.data : ""));
+  ADD(args, INTEGER_OBJ(compl_col));
+  ADD(args, INTEGER_OBJ(compl_ticket));
+  ADD(args, INTEGER_OBJ(ctrl_x_mode));
+
+  Error err = ERROR_INIT;
+  NLUA_EXEC_STATIC(
+    "require('vim._core.completion')._get_matches(...)",
+    args, kRetNilBool, NULL, &err);
+  api_free_array(args);
+
+  if (ERROR_SET(&err)) {
+    emsg(err.msg);
+    api_clear_error(&err);
   }
 
-  int match_count = -1;  // total of matches, unknown
-  if (found_new_match == FAIL
-      || (ctrl_x_mode_not_default() && !ctrl_x_mode_line_or_eval())) {
-    match_count = ins_compl_make_cyclic();
-  }
-
-  if (cot_fuzzy() && compl_get_longest && compl_num_bests > 0) {
-    fuzzy_longest_match();
-  }
-
-  if (compl_old_match != NULL) {
-    // If several matches were added (FORWARD) or the search failed and has
-    // just been made cyclic then we have to move compl_curr_match to the
-    // next or previous entry (if any) -- Acevedo
-    compl_curr_match = compl_dir_forward()
-                       ? compl_old_match->cp_next
-                       : compl_old_match->cp_prev;
-    if (compl_curr_match == NULL) {
-      compl_curr_match = compl_old_match;
-    }
-  }
-  may_trigger_modechanged();
-
-  if (match_count > 0 && !ctrl_x_mode_spell()) {
-    if (is_nearest_active() && !ins_compl_has_preinsert()) {
-      sort_compl_match_list(cp_compare_nearest);
-    }
-
-    if (cot_fuzzy() && ins_compl_leader_len() > 0) {
-      ins_compl_fuzzy_sort();
-    }
-  }
-
-  return match_count;
+  return ins_compl_make_cyclic();
 }
 
 /// Update "compl_shown_match" to the actually shown match, it may differ when
@@ -6624,4 +6524,210 @@ void f_preinserted(typval_T *argvars, typval_T *rettv, EvalFuncData fptr)
   if (ins_compl_preinsert_effect()) {
     rettv->vval.v_number = 1;
   }
+}
+
+/// Start a new completion session for external (Lua) sources.
+/// Returns a ticket that callers must pass to ins_compl_add_items()
+/// to prove the session is still valid.
+int64_t ins_compl_start_session(colnr_T startcol)
+{
+  if (compl_started) {
+    ins_compl_free();
+  }
+  ins_compl_clear();
+
+  compl_ticket++;
+  if (startcol > curwin->w_cursor.col) {
+    startcol = curwin->w_cursor.col;
+  }
+
+  compl_col = startcol;
+  compl_lnum = curwin->w_cursor.lnum;
+  compl_length = curwin->w_cursor.col - startcol;
+  compl_direction = FORWARD;
+  compl_get_longest = (get_cot_flags() & kOptCotFlagLongest) != 0;
+  compl_orig_text = cbuf_to_string(get_cursor_line_ptr() + compl_col,
+                                   (size_t)compl_length);
+  save_orig_extmarks();
+
+  int flags = CP_ORIGINAL_TEXT | CP_FAST | (p_ic ? CP_ICASE : 0);
+  ins_compl_add(compl_orig_text.data, (int)compl_orig_text.size,
+                NULL, NULL, false, NULL, 0, flags, false, NULL,
+                FUZZY_SCORE_NONE);
+
+  ctrl_x_mode = CTRL_X_EVAL;
+  compl_started = true;
+  compl_used_match = true;
+  compl_cont_status = 0;
+
+  return compl_ticket;
+}
+
+/// Add items to the current completion session.
+/// If ticket doesn't match the current session, items are silently dropped.
+/// Each item in the array can be a String ("word") or a Dict (complete-items).
+///
+/// When source_idx >= 0 and startcol > compl_col, each item's "word" is
+/// automatically prefixed with line[compl_col..startcol] so the popup can
+/// stay anchored at compl_col while each source advertises its own logical
+/// anchor.  This centralises the gap compensation that individual sources
+/// would otherwise have to do themselves.
+///
+/// Left-expansion (startcol < compl_col) is not supported in this phase
+/// and is silently clamped to compl_col.
+///
+/// If the popup is currently visible when this is called (i.e. async
+/// delivery after the initial show), it is refreshed in place.  The PUM
+/// dimensions are locked at first show (pum_lock_dimensions), so the
+/// refresh reuses the same grid size — no resize flicker; content updates,
+/// scrollbar may appear.
+///
+/// @param ticket   Session ticket from ins_compl_start_session() or compl_ticket.
+/// @param source_idx  Index into cpt_sources_array for this source (-1 = unset).
+/// @param startcol    Start column for this source (-3 = use compl_col).
+///                    Only applied when source_idx >= 0.
+/// @param items   Array of completion items (String or Dict).
+///
+/// @return true if items were added, false if session expired.
+bool ins_compl_add_items(int64_t ticket, int64_t source_idx, int64_t startcol, Array *items)
+{
+  if (ticket != compl_ticket || !compl_started) {
+    return false;
+  }
+
+  // Temporarily set cpt_sources_index so that ins_compl_add() tags each
+  // match with the correct source.  Also set the source's startcol.
+  int saved_idx = cpt_sources_index;
+  char *gap_prefix = NULL;  // line[compl_col..startcol], NULL when no gap.
+  int gap_len = 0;
+
+  if (source_idx >= 0) {
+    // Grow cpt_sources_array if this source index is beyond the current
+    // count (happens for non-'cpt' sources like LSP).
+    if (source_idx >= cpt_sources_count) {
+      int new_count = (int)source_idx + 1;
+      cpt_sources_array = xrealloc(cpt_sources_array,
+                                   (size_t)new_count * sizeof(cpt_source_T));
+      for (int j = cpt_sources_count; j < new_count; j++) {
+        memset(&cpt_sources_array[j], 0, sizeof(cpt_source_T));
+        cpt_sources_array[j].cs_startcol = -3;
+      }
+      cpt_sources_count = new_count;
+    }
+    cpt_sources_index = (int)source_idx;
+
+    if (startcol != -3) {
+      // Left-expansion is not supported in this phase: silently clamp.
+      if (startcol < compl_col) {
+        startcol = compl_col;
+      }
+      cpt_sources_array[(int)source_idx].cs_startcol = (int)startcol;
+
+      // Compute gap prefix for this source's items.  Must be on the
+      // same line as the completion session; otherwise skip the gap.
+      if (startcol > compl_col && compl_lnum == curwin->w_cursor.lnum) {
+        char *line = ml_get(compl_lnum);
+        int line_len = ml_get_len(compl_lnum);
+        if (startcol <= line_len) {
+          gap_len = (int)(startcol - compl_col);
+          gap_prefix = xmemdupz(line + compl_col, (size_t)gap_len);
+        }
+      }
+    }
+  }
+
+  // Anchor for async delivery: ins_compl_add() inserts the new match
+  // relative to compl_curr_match.  During the initial synchronous
+  // collection this is fine — curr_match trails the growing list.
+  // But once the session is LIVE (PUM visible, user may have navigated)
+  // compl_curr_match points to whatever the user selected, and new
+  // async items would be inserted there, scrambling order.  Temporarily
+  // point compl_curr_match at the cyclic list's tail (the entry right
+  // before compl_first_match, since it's circular) so async items land
+  // at the end of the real list, just before the original_text entry.
+  compl_T *saved_curr = compl_curr_match;
+  bool retargeted = false;
+  if (compl_first_match != NULL
+      && compl_first_match->cp_prev != NULL
+      && compl_match_array != NULL) {
+    // PUM has been shown at least once → this is async delivery.
+    compl_curr_match = compl_first_match->cp_prev;
+    retargeted = true;
+  }
+
+  bool added = false;
+  Error err = ERROR_INIT;
+  for (size_t i = 0; i < items->size; i++) {
+    Object obj = items->items[i];
+
+    if (obj.type == kObjectTypeString) {
+      String *s = &obj.data.string;
+      if (gap_prefix != NULL) {
+        size_t new_size = (size_t)gap_len + s->size;
+        char *buf = xmalloc(new_size + 1);
+        memcpy(buf, gap_prefix, (size_t)gap_len);
+        memcpy(buf + gap_len, s->data, s->size);
+        buf[new_size] = NUL;
+        if (ins_compl_add(buf, (int)new_size, NULL, NULL, false,
+                          NULL, FORWARD, CP_FAST, false, NULL,
+                          FUZZY_SCORE_NONE) == OK) {
+          added = true;
+        }
+        xfree(buf);
+      } else {
+        if (ins_compl_add(s->data, (int)s->size, NULL, NULL, false,
+                          NULL, FORWARD, CP_FAST, false, NULL,
+                          FUZZY_SCORE_NONE) == OK) {
+          added = true;
+        }
+      }
+    } else if (obj.type == kObjectTypeDict) {
+      typval_T tv;
+      object_to_vim(obj, &tv, &err);
+      if (ERROR_SET(&err)) {
+        api_clear_error(&err);
+        continue;
+      }
+      // Patch the dict's "word" field with gap-compensated value before
+      // handing off to ins_compl_add_tv().
+      if (gap_prefix != NULL && tv.v_type == VAR_DICT && tv.vval.v_dict != NULL) {
+        dictitem_T *di = tv_dict_find(tv.vval.v_dict, S_LEN("word"));
+        if (di != NULL && di->di_tv.v_type == VAR_STRING
+            && di->di_tv.vval.v_string != NULL) {
+          char *orig = di->di_tv.vval.v_string;
+          size_t orig_len = strlen(orig);
+          char *buf = xmalloc((size_t)gap_len + orig_len + 1);
+          memcpy(buf, gap_prefix, (size_t)gap_len);
+          memcpy(buf + gap_len, orig, orig_len);
+          buf[(size_t)gap_len + orig_len] = NUL;
+          xfree(orig);
+          di->di_tv.vval.v_string = buf;
+        }
+      }
+      ins_compl_add_tv(&tv, FORWARD, true);
+      tv_clear(&tv);
+      added = true;
+    }
+  }
+
+  xfree(gap_prefix);
+  cpt_sources_index = saved_idx;
+
+  // Restore user's navigation position.
+  if (retargeted) {
+    compl_curr_match = saved_curr;
+  }
+
+  // Async delivery: if the PUM is currently visible, refresh it so the
+  // new items are visible.  Dimensions are locked by ins_compl_show_pum,
+  // so the refresh takes the cheap in-place path — the popup doesn't
+  // resize or flicker; its contents just update, and a scrollbar
+  // appears if we've exceeded the locked height.
+  if (added && compl_started && pum_visible()) {
+    compl_matches = ins_compl_make_cyclic();
+    ins_compl_del_pum();
+    ins_compl_show_pum();
+  }
+
+  return added;
 }

@@ -10,6 +10,7 @@
 #include "nvim/api/buffer.h"
 #include "nvim/api/private/defs.h"
 #include "nvim/api/private/helpers.h"
+#include "nvim/api/private/validate.h"
 #include "nvim/api/vim.h"
 #include "nvim/api/win_config.h"
 #include "nvim/ascii_defs.h"
@@ -88,11 +89,45 @@ static bool pum_is_drawn = false;
 static bool pum_external = false;
 static bool pum_invalid = false;  // the screen was just cleared
 
+/// Dimension-lock mechanism for async completion delivery.
+///
+/// When the popup is first shown for a completion session the caller
+/// (ins_compl_show_pum) invokes pum_lock_dimensions() to freeze the
+/// current width / height / column widths.  Subsequent rebuilds of
+/// compl_match_array (driven by async source delivery, leader changes,
+/// etc.) then go through pum_display() / pum_compute_size() /
+/// pum_compute_horizontal_placement() / pum_compute_vertical_placement()
+/// with no visible jitter: pum_grid keeps the same rows/cols, so
+/// pum_redraw() takes the fast `grid_invalidate` path instead of the
+/// costly `grid_alloc + ui_call_grid_resize` path, and the UI sees an
+/// in-place content update rather than a resize flash.
+///
+/// When `pumheight == 0` (user opted out of height capping) we only
+/// lock width — the user explicitly accepted PUM growth.
+///
+/// unlocked when the session ends (ins_compl_stop / ins_compl_clear).
+static bool pum_dims_locked = false;
+static bool pum_lock_height = false;
+static int pum_locked_width = 0;
+static int pum_locked_height = 0;
+static int pum_locked_base_width = 0;
+static int pum_locked_kind_width = 0;
+static int pum_locked_extra_width = 0;
+
 #include "popupmenu.c.generated.h"
 #define PUM_DEF_HEIGHT 10
 
 static void pum_compute_size(void)
 {
+  // Locked: reuse the widths captured at first display.  Prevents the
+  // popup from "jumping wider" when a long LSP item arrives asynchronously.
+  if (pum_dims_locked) {
+    pum_base_width = pum_locked_base_width;
+    pum_kind_width = pum_locked_kind_width;
+    pum_extra_width = pum_locked_extra_width;
+    return;
+  }
+
   // Compute the width of the widest match and the widest extra.
   pum_base_width = 0;
   pum_kind_width = 0;
@@ -130,6 +165,15 @@ static void pum_compute_vertical_placement(int size, win_T *target_win, int pum_
   pum_height = MIN(size, PUM_DEF_HEIGHT);
   if (p_ph > 0 && pum_height > p_ph) {
     pum_height = (int)p_ph;
+  }
+
+  // When height is locked (async completion refresh), pretend `size` is
+  // the locked height for placement decisions so the computed pum_height
+  // stays stable even as the list grows.  We still go through the full
+  // above/below branch logic because pum_row depends on layout, not size.
+  if (pum_dims_locked && pum_lock_height) {
+    size = pum_locked_height;
+    pum_height = pum_locked_height;
   }
 
   // Put the pum below "pum_win_row" if possible.
@@ -197,6 +241,13 @@ static void pum_compute_vertical_placement(int size, win_T *target_win, int pum_
     pum_row = above_row;
     pum_height = pum_win_row - above_row;
   }
+
+  // Final clamp when height is locked: placement branches may have
+  // narrowed pum_height (e.g. not enough vertical space), but we never
+  // want to exceed the locked height either.  The MIN handles both.
+  if (pum_dims_locked && pum_lock_height) {
+    pum_height = MIN(pum_height, pum_locked_height);
+  }
 }
 
 /// Try to set "pum_width" so that it fits within available_width.
@@ -223,6 +274,33 @@ static bool set_pum_width_aligned_with_cursor(int width, int available_width)
 static void pum_compute_horizontal_placement(win_T *target_win, int cursor_col)
 {
   int max_col = MAX(Columns, target_win ? (target_win->w_wincol + target_win->w_view_width) : 0);
+
+  // Width lock: keep the popup the same width as it was first shown.
+  // pum_col still follows cursor_col so the popup continues to anchor
+  // at the completion column.  If the cursor moves near the right edge
+  // we shift pum_col left as needed so the locked width fits.
+  if (pum_dims_locked) {
+    pum_width = pum_locked_width;
+    if (pum_rl) {
+      pum_col = cursor_col;
+      if (pum_col - pum_width - pum_scrollbar < 0) {
+        pum_col = pum_width + pum_scrollbar;
+        if (pum_col > max_col - 1) {
+          pum_col = max_col - 1;
+        }
+      }
+    } else {
+      pum_col = cursor_col;
+      if (pum_col + pum_width + pum_scrollbar > max_col) {
+        pum_col = max_col - pum_width - pum_scrollbar;
+        if (pum_col < 0) {
+          pum_col = 0;
+        }
+      }
+    }
+    return;
+  }
+
   int desired_width = pum_base_width + pum_kind_width + pum_extra_width;
   int available_width;
 
@@ -1282,6 +1360,7 @@ static bool pum_set_selected(int n, int repeat)
   return resized;
 }
 
+
 /// Undisplay the popup menu (later).
 void pum_undisplay(bool immediate)
 {
@@ -1340,6 +1419,39 @@ bool pum_drawn(void)
 void pum_invalidate(void)
 {
   pum_invalid = true;
+}
+
+/// Freeze the popup's current dimensions.
+///
+/// Called by the completion engine right after the popup first becomes
+/// visible for a session.  From this point until pum_unlock_dimensions(),
+/// subsequent pum_display() calls reuse the captured width / height /
+/// column widths, so async deliveries, leader changes, etc. rebuild
+/// pum_match_array without resizing the visible window — pum_redraw()
+/// takes the fast in-place invalidate path.
+///
+/// When the user has `pumheight == 0` (no cap), we only lock width;
+/// they've explicitly opted into vertical growth, so respect that.
+void pum_lock_dimensions(void)
+{
+  if (!pum_is_drawn) {
+    // Nothing to lock yet — will happen on the first successful display.
+    return;
+  }
+  pum_dims_locked = true;
+  pum_lock_height = (p_ph > 0);  // only lock height if 'pumheight' is set
+  pum_locked_width = pum_width;
+  pum_locked_height = pum_height;
+  pum_locked_base_width = pum_base_width;
+  pum_locked_kind_width = pum_kind_width;
+  pum_locked_extra_width = pum_extra_width;
+}
+
+/// Release the dimension lock.  Call at completion session end.
+void pum_unlock_dimensions(void)
+{
+  pum_dims_locked = false;
+  pum_lock_height = false;
 }
 
 void pum_recompose(void)
