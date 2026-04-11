@@ -312,6 +312,7 @@ local config = {
       -- Sections at the end, in a specific order:
       'util.lua',
       'protocol.lua',
+      'mouse.lua',
     },
     files = {
       'runtime/lua/vim/lsp',

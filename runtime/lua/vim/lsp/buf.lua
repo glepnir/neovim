@@ -27,6 +27,8 @@ local rename_ns = api.nvim_create_namespace('nvim.lsp.rename_range')
 
 --- @class vim.lsp.buf.hover.Opts : vim.lsp.util.open_floating_preview.Opts
 --- @field silent? boolean
+--- @field param? fun(client: vim.lsp.Client): lsp.TextDocumentPositionParams
+--- @field should_display? fun(): boolean
 
 --- Displays hover information about the symbol under the cursor in a floating
 --- window. The window will be dismissed on cursor move.
@@ -51,8 +53,9 @@ function M.hover(config)
 
   config = config or {}
   config.focus_id = 'textDocument/hover'
+  local param = config.param and config.param or client_positional_params()
 
-  lsp.buf_request_all(0, 'textDocument/hover', client_positional_params(), function(results, ctx)
+  lsp.buf_request_all(0, 'textDocument/hover', param, function(results, ctx)
     local bufnr = assert(ctx.bufnr)
     if api.nvim_get_current_buf() ~= bufnr then
       -- Ignore result since buffer changed. This happens for slow language servers.
@@ -105,6 +108,10 @@ function M.hover(config)
           vim.notify('No information available', vim.log.levels.INFO)
         end
       end
+      return
+    end
+
+    if config.should_display and not config.should_display() then
       return
     end
 

@@ -99,6 +99,8 @@ LSP
   • `textDocument/bar` …
     https://microsoft.github.io/language-server-protocol/specification/#textDocument_colorPresentation
 • Support for nested snippets.
+• add |vim.lsp.mouse.enable()| for mouse hover and diagnostic floating window.
+• todo
 
 LUA
 

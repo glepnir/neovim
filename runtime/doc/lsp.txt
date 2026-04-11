@@ -1360,7 +1360,9 @@ the current buffer.
 
 
     Fields: ~
-      • {silent}?  (`boolean`)
+      • {silent}?          (`boolean`)
+      • {param}?           (`fun(client: vim.lsp.Client): lsp.TextDocumentPositionParams`)
+      • {should_display}?  (`fun(): boolean`)
 
 *vim.lsp.buf.signature_help.Opts*
     Extends: |vim.lsp.util.open_floating_preview.Opts|
@@ -3131,6 +3133,36 @@ resolve_capabilities({server_capabilities})
 
     Return: ~
         (`lsp.ServerCapabilities?`) Normalized table of capabilities
+
+
+==============================================================================
+Lua module: vim.lsp.mouse                                          *lsp-mouse*
+
+*vim.lsp.mouse.Opts*
+
+    Fields: ~
+      • {delay}         (`integer`) Debounce delay in milliseconds. (default:
+                        `500`)
+      • {close_events}  (`vim.api.keyset.events[]`) Autocmd events that
+                        dismiss the float. (default: `InsertEnter`,
+                        `CursorMoved`, `BufLeave`, `WinLeave`, `WinScrolled`)
+
+
+enable({enabled}, {opts})                             *vim.lsp.mouse.enable()*
+    Enable or disable LSP mouse hover and diagnostic popups.
+
+    Requires 'mousemoveevent' to be set: >lua
+        vim.o.mousemoveevent = true
+<
+
+    Parameters: ~
+      • {enabled}  (`boolean?`)
+      • {opts}     (`vim.lsp.mouse.Opts?`) See |vim.lsp.mouse.Opts|.
+
+is_enabled()                                      *vim.lsp.mouse.is_enabled()*
+
+    Return: ~
+        (`boolean`)
 
 
  vim:tw=78:ts=8:sw=4:sts=4:et:ft=help:norl:
