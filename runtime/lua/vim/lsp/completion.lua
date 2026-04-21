@@ -56,6 +56,8 @@ local ns_to_ms = 0.000001
 --- @field clients table<integer, vim.lsp.Client>
 --- @field triggers table<string, vim.lsp.Client[]>
 --- @field convert? fun(item: lsp.CompletionItem): table
+--- @field cmp? fun(a: table, b: table): boolean
+--- @field insertMode 'insert'|'replace'
 
 --- @type table<integer, vim.lsp.completion.BufHandle>
 local buf_handles = {}
@@ -236,9 +238,9 @@ local function apply_defaults(item, defaults)
     textEdit.newText = textEdit.newText or item.textEditText or item.insertText or item.label
     if defaults.editRange.start then
       textEdit.range = textEdit.range or defaults.editRange
-    elseif defaults.editRange.insert then
-      textEdit.insert = defaults.editRange.insert
-      textEdit.replace = defaults.editRange.replace
+    elseif defaults.editRange.insert and defaults.editRange.replace then
+      textEdit.insert = textEdit.insert or defaults.editRange.insert
+      textEdit.replace = textEdit.replace or defaults.editRange.replace
     end
   end
 end
@@ -853,13 +855,40 @@ local function on_complete_done()
 
   local position_encoding = client.offset_encoding or 'utf-16'
   local resolve_provider = (client.server_capabilities.completionProvider or {}).resolveProvider
+  local insert_mode = vim.tbl_get(buf_handles, bufnr, 'insertMode') or 'replace'
 
   -- Keep reference to avoid race where completion/resolve response arrives after on_insert_leave
   -- and Context.cursor got cleared before clear_word() gets called
   local context_cursor = assert(Context.cursor)
 
   local function clear_word()
+    local end_row = cursor_row
+    local end_col = cursor_col
+
+    local text_edit = completion_item.textEdit
+    if
+      insert_mode == 'replace'
+      and text_edit
+      and text_edit.insert
+      and text_edit.replace
+      and text_edit.insert['end'].line == end_row
+      and text_edit.replace['end'].line == end_row
+    then
+      local extra = text_edit.replace['end'].character - text_edit.insert['end'].character
+      if extra > 0 then
+        local line = api.nvim_buf_get_lines(bufnr, end_row, end_row + 1, true)[1] or ''
+        local cur_char = vim.str_utfindex(line, position_encoding, end_col)
+        local new_end = vim.str_byteindex(line, position_encoding, cur_char + extra, false)
+        if new_end and new_end > end_col then
+          end_col = new_end
+        end
+      end
+    end
+
     if not expand_snippet then
+      if end_col > cursor_col then
+        api.nvim_buf_set_text(bufnr, cursor_row, cursor_col, cursor_row, end_col, { '' })
+      end
       return nil
     end
 
@@ -868,8 +897,8 @@ local function on_complete_done()
       bufnr,
       context_cursor[1] - 1,
       context_cursor[2] - 1,
-      cursor_row,
-      cursor_col,
+      end_row,
+      end_col,
       { '' }
     )
   end
@@ -1123,6 +1152,7 @@ end
 --- @field autotrigger? boolean  (default: false) When true, completion triggers automatically based on the server's `triggerCharacters`.
 --- @field convert? fun(item: lsp.CompletionItem): table Transforms an LSP CompletionItem to |complete-items|.
 --- @field cmp? fun(a: table, b: table): boolean Comparator for sorting merged completion items from all servers.
+--- @field insertMode? 'insert'|'replace' For `InsertReplaceEdit` items. `'replace'` (default) overwrites text after the cursor; `'insert'` leaves it alone.
 
 ---@param client_id integer
 ---@param bufnr integer
@@ -1130,7 +1160,13 @@ end
 local function enable_completions(client_id, bufnr, opts)
   local buf_handle = buf_handles[bufnr]
   if not buf_handle then
-    buf_handle = { clients = {}, triggers = {}, convert = opts.convert, cmp = opts.cmp }
+    buf_handle = {
+      clients = {},
+      triggers = {},
+      convert = opts.convert,
+      cmp = opts.cmp,
+      insertMode = opts.insertMode or 'replace',
+    }
     buf_handles[bufnr] = buf_handle
 
     -- Attach to buffer events.

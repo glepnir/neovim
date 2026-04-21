@@ -2193,6 +2193,10 @@ enable({enable}, {client_id}, {bufnr}, {opts})
                        Transforms an LSP CompletionItem to |complete-items|.
                      • {cmp}? (`fun(a: table, b: table): boolean`) Comparator
                        for sorting merged completion items from all servers.
+                     • {insertMode}? (`'insert'|'replace'`) For
+                       `InsertReplaceEdit` items. `'replace'` (default)
+                       overwrites text after the cursor; `'insert'` leaves it
+                       alone.
 
 get({opts})                                         *vim.lsp.completion.get()*
     Triggers LSP completion once in the current buffer, if LSP completion is
