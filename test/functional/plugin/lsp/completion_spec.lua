@@ -875,9 +875,9 @@ describe('vim.lsp.completion: protocol', function()
     exec_lua(function()
       _G.capture = {}
       --- @diagnostic disable-next-line:duplicate-set-field
-      vim.fn.complete = function(col, matches)
-        _G.capture.col = col
-        _G.capture.matches = matches
+      vim.api.nvim__complete = function(opts)
+        _G.capture.col = opts.col
+        _G.capture.matches = opts.items
       end
     end)
   end)
@@ -1286,7 +1286,7 @@ describe('vim.lsp.completion: integration', function()
     clear()
     exec_lua(create_server_definition)
     exec_lua(function()
-      vim.fn.complete = vim.schedule_wrap(vim.fn.complete)
+      vim.api.nvim__complete = vim.schedule_wrap(vim.api.nvim__complete)
     end)
   end)
 

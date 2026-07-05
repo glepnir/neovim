@@ -41,6 +41,11 @@ local protocol = lsp.protocol
 local rtt_ms = 50.0
 local ns_to_ms = 0.000001
 
+--- Name used for the builtin in-process buffer-word completion client.
+local BUILTIN_SERVER_NAME = 'nvim.completion'
+
+local log = vim.lsp.log
+
 --- @alias vim.lsp.CompletionResult lsp.CompletionList | lsp.CompletionItem[]
 
 -- TODO(mariasolos): Remove this declaration once we figure out a better way to handle
@@ -59,6 +64,7 @@ local ns_to_ms = 0.000001
 --- @field convert? fun(item: lsp.CompletionItem): table
 
 --- @type table<integer, vim.lsp.completion.BufHandle>
+
 local buf_handles = {}
 
 --- @nodoc
@@ -68,6 +74,9 @@ local Context = {
   last_request_time = nil, --- @type integer?
   pending_requests = {}, --- @type function[]
   isIncomplete = false,
+  -- Monotonic trigger generation: a response is applied only if it belongs
+  -- to the latest trigger (see the guard in trigger()'s callback).
+  generation = 0,
   -- Handles "completionItem/resolve".
   resolve_handler = nil, --- @type CompletionResolver?
 }
@@ -170,6 +179,14 @@ local function apply_snippet(item)
 end
 
 local function fallback_filtertext(item, word, prefix, match)
+  -- An item may declare its insert text authoritative: the in-process server
+  -- sets data.keep_word on items whose filterText exists only to pass the
+  -- prefix filter (e.g. cmdline candidates for a typed glob, where no
+  -- candidate starts with the base) -- substituting the filterText would
+  -- insert the filter value instead of the match.
+  if vim.tbl_get(item, 'data', 'keep_word') then
+    return word
+  end
   if item.filterText and not match(word, prefix) and match(item.filterText, prefix) then
     return item.filterText
   end
@@ -478,6 +495,11 @@ function M._lsp_to_complete_items(
       end
       local kind, kind_hlgroup = generate_kind(item)
       local info, info_kind, info_complete = complete_item_info(item)
+      -- When the inserted word doesn't start with the typed prefix (e.g.
+      -- 'showfulltag' inserts a definition line, thesaurus inserts synonyms),
+      -- mark it CP_EQUAL so the native leader filter in insexpand keeps it
+      -- instead of dropping it for not matching the prefix.
+      local needs_equal = word ~= '' and prefix ~= '' and not match_item_by_value(word, prefix)
       local completion_item = {
         word = word,
         abbr = ('%s%s'):format(item.label, vim.tbl_get(item, 'labelDetails', 'detail') or ''),
@@ -485,11 +507,15 @@ function M._lsp_to_complete_items(
         menu = vim.tbl_get(item, 'labelDetails', 'description') or '',
         info = info,
         icase = 1,
+        equal = needs_equal and 1 or nil,
         dup = 1,
         empty = 1,
         abbr_hlgroup = hl_group,
         kind_hlgroup = kind_hlgroup,
         preselect = item.preselect,
+        -- Adding-mode "word from other line" marker; ins_compl_add_tv() maps
+        -- it to CP_CONT_S_IPOS so the native S_IPOS -> SOL chain keeps working.
+        cont_s_ipos = vim.tbl_get(item, 'data', 'cont_s_ipos') and 1 or nil,
         user_data = {
           nvim = {
             lsp = {
@@ -497,10 +523,10 @@ function M._lsp_to_complete_items(
               info_kind = info_kind,
               completion_item_needs_resolving = server_supports_resolve and not info_complete,
               client_id = client_id,
+              _fuzzy_score = score,
             },
           },
         },
-        _fuzzy_score = score,
       }
       if user_convert then
         completion_item = vim.tbl_extend('keep', user_convert(item), completion_item)
@@ -518,22 +544,25 @@ function M._lsp_to_complete_items(
       return (itema.sortText or itema.label) < (itemb.sortText or itemb.label)
     end
 
+    -- Sort by fuzzy score when 'completeopt' contains "fuzzy" and a prefix
+    -- was typed, so the best fuzzy match comes first regardless of the
+    -- server's sortText (#33610); ties fall back to sortText/label order.
     local use_fuzzy_sort = has_completeopt('fuzzy')
       and not has_completeopt('nosort')
       and not result.isIncomplete
       and #prefix > 0
 
-    local compare_fn = use_fuzzy_sort
-        and function(a, b)
-          local score_a = a._fuzzy_score or 0
-          local score_b = b._fuzzy_score or 0
-          if score_a ~= score_b then
-            return score_a > score_b
-          end
-          return compare_by_sortText_and_label(a, b)
+    local compare_fn = compare_by_sortText_and_label
+    if use_fuzzy_sort then
+      compare_fn = function(a, b)
+        local score_a = a.user_data.nvim.lsp._fuzzy_score or 0
+        local score_b = b.user_data.nvim.lsp._fuzzy_score or 0
+        if score_a ~= score_b then
+          return score_a > score_b
         end
-      or compare_by_sortText_and_label
-
+        return compare_by_sortText_and_label(a, b)
+      end
+    end
     table.sort(candidates, compare_fn)
   end
   return candidates
@@ -630,6 +659,13 @@ local function request(clients, bufnr, win, ctx, callback)
   local request_ids = {} --- @type table<integer, integer>
   local remaining_requests = vim.tbl_count(clients)
 
+  -- No client can ever respond: complete the aggregation immediately instead
+  -- of leaving the callback (and the completion session) waiting forever.
+  if remaining_requests == 0 then
+    callback(responses)
+    return function() end
+  end
+
   for _, client in pairs(clients) do
     local client_id = client.id
     local params = lsp.util.make_position_params(win, client.offset_encoding)
@@ -645,6 +681,16 @@ local function request(clients, bufnr, win, ctx, callback)
 
     if ok then
       request_ids[client_id] = request_id
+    else
+      -- The request never went out (e.g. the client is still initializing,
+      -- which the fallback attach in _builtin_trigger can hit on its very
+      -- first keystroke). Count it down without a response entry: leaving
+      -- remaining_requests un-decremented would hang the aggregation and the
+      -- session would silently never appear.
+      remaining_requests = remaining_requests - 1
+      if remaining_requests == 0 then
+        callback(responses)
+      end
     end
   end
 
@@ -953,7 +999,14 @@ local function trigger(bufnr, clients, ctx)
   reset_timer()
   Context:cancel_pending()
 
-  if vim.fn.pumvisible() ~= 0 and not Context.isIncomplete then
+  -- A visible popup suppresses a new LSP auto-request (the user is
+  -- navigating), but a builtin CTRL-X trigger (ctx.mode set) is an explicit
+  -- manual request that supersedes whatever session is showing: let it
+  -- through; applying it (nvim__complete() -> set_completion() ->
+  -- ins_compl_prep(' ')) stops the old session first. E.g. a manual ^X^L
+  -- while an 'autocomplete' popup is open (Test_autocomplete_trigger) must
+  -- still route.
+  if vim.fn.pumvisible() ~= 0 and not Context.isIncomplete and not (ctx and ctx.mode) then
     return
   end
 
@@ -962,7 +1015,11 @@ local function trigger(bufnr, clients, ctx)
   end
 
   local win = api.nvim_get_current_win()
-  local cursor_row = api.nvim_win_get_cursor(win)[1]
+  local cursor_row, req_col = unpack(api.nvim_win_get_cursor(win)) --- @type integer, integer
+  local req_line = api.nvim_get_current_line()
+  local req_tick = api.nvim_buf_get_changedtick(bufnr)
+  Context.generation = Context.generation + 1
+  local gen = Context.generation
   local start_time = vim.uv.hrtime() --[[@as integer]]
   Context.last_request_time = start_time
 
@@ -973,14 +1030,49 @@ local function trigger(bufnr, clients, ctx)
     Context.pending_requests = {}
     Context.isIncomplete = false
 
-    local new_cursor_row, cursor_col = unpack(api.nvim_win_get_cursor(win)) --- @type integer, integer
-    local row_changed = new_cursor_row ~= cursor_row
+    -- Async responses can arrive at any later moment; apply one only if the
+    -- editing context it was requested for is still current:
+    --  * generation: a newer trigger supersedes this response outright --
+    --    without it a slow source's reply lands inside the *next* session
+    --    (a stale omni response bleeding into a keyword round).
+    --  * buffer/row/changedtick: any text change since the request makes the
+    --    request-time columns meaningless (a stale textEdit applied against
+    --    new text tears multibyte words apart).
+    if gen ~= Context.generation then
+      log.warn(('BUILTIN guard DROP: generation gen=%d cur=%d'):format(gen, Context.generation))
+      return
+    end
     local mode = api.nvim_get_mode().mode
-    if row_changed or not (mode == 'i' or mode == 'ic') then
+    local cur_buf = api.nvim_get_current_buf()
+    local cur_row = api.nvim_win_is_valid(win) and api.nvim_win_get_cursor(win)[1] or -1
+    local cur_tick = api.nvim_buf_get_changedtick(bufnr)
+    if
+      not (mode == 'i' or mode == 'ic')
+      or not api.nvim_win_is_valid(win)
+      or cur_buf ~= bufnr
+      or cur_row ~= cursor_row
+      or cur_tick ~= req_tick
+    then
+      log.warn(
+        ('BUILTIN guard DROP: mode=%q winvalid=%s buf=%d/%d row=%d/%d tick=%d/%d'):format(
+          mode,
+          tostring(api.nvim_win_is_valid(win)),
+          cur_buf,
+          bufnr,
+          cur_row,
+          cursor_row,
+          cur_tick,
+          req_tick
+        )
+      )
       return
     end
 
-    local line = api.nvim_get_current_line()
+    -- Request-time snapshot: the changedtick guard above proves the text is
+    -- unchanged, and the captured column keeps the boundary math on the same
+    -- basis as the items' textEdit ranges.
+    local cursor_col = req_col
+    local line = req_line
     local line_to_cursor = line:sub(1, cursor_col)
     local word_boundary = vim.fn.match(line_to_cursor, '\\k*$')
 
@@ -1030,16 +1122,23 @@ local function trigger(bufnr, clients, ctx)
     end
 
     --- @type table[]
-    local prev_matches = vim.fn.complete_info({ 'items', 'matches' })['items']
+    local prev_matches = {}
+    if not (ctx and ctx.mode) then
+      -- Merge still-valid items from other clients (multi-client LSP). A
+      -- builtin CTRL-X source (ctx.mode set) replaces the session wholesale
+      -- through set_completion(); merging a still-active previous session's
+      -- items here would duplicate them into the new list.
+      prev_matches = vim.fn.complete_info({ 'items', 'matches' })['items']
 
-    --- @param prev_match table
-    prev_matches = vim.tbl_filter(function(prev_match)
-      local client_id = vim.tbl_get(prev_match, 'user_data', 'nvim', 'lsp', 'client_id')
-      if client_id and responses[client_id] ~= nil then
-        return false
-      end
-      return vim.tbl_get(prev_match, 'match')
-    end, prev_matches)
+      --- @param prev_match table
+      prev_matches = vim.tbl_filter(function(prev_match)
+        local client_id = vim.tbl_get(prev_match, 'user_data', 'nvim', 'lsp', 'client_id')
+        if client_id and responses[client_id] ~= nil then
+          return false
+        end
+        return vim.tbl_get(prev_match, 'match')
+      end, prev_matches)
+    end
 
     matches = vim.list_extend(prev_matches, matches)
     local user_cmp = vim.tbl_get(buf_handles, bufnr, 'cmp')
@@ -1055,7 +1154,20 @@ local function trigger(bufnr, clients, ctx)
         on_completechanged(group, bufnr)
       end
     end
-    vim.fn.complete(start_col, matches)
+    -- vim.fn.complete(start_col, matches)
+    local apply_ok, apply_ret = pcall(vim.api.nvim__complete, {
+      col = start_col,
+      items = matches,
+      mode = ctx and ctx.mode or nil,
+      backward = ctx and ctx.backward or nil,
+    })
+    if not apply_ok then
+      log.warn(('builtin apply failed: %s'):format(tostring(apply_ret)))
+    elseif type(apply_ret) == 'number' and apply_ret < 0 then
+      log.warn(
+        ('builtin apply rejected: ret=%d n=%d col=%d'):format(apply_ret, #matches, start_col)
+      )
+    end
   end)
 
   table.insert(Context.pending_requests, cancel_request)
@@ -1269,6 +1381,112 @@ function M.get(opts)
   trigger(bufnr, clients, ctx)
 end
 
+--- The builtin in-process client attached to `bufnr`, if any.
+--- @param bufnr integer
+--- @return vim.lsp.Client?
+local function get_builtin_client(bufnr)
+  return lsp.get_clients({ name = BUILTIN_SERVER_NAME, bufnr = bufnr })[1]
+end
+
+--- Ensure the builtin in-process completion server is attached to `bufnr` and
+--- return its client. Unlike external servers (started via |vim.lsp.enable| on
+--- a FileType match), this attaches on demand to the current buffer regardless
+--- of its filetype, so it also covers scratch and unnamed buffers.
+--- vim.lsp.start() deduplicates by name, so the client is reused across
+--- buffers.
+---
+--- The builtin client is deliberately NOT registered through M.enable():
+--- buf_handles is the registry of user-enabled LSP completion clients,
+--- consumed by get(), autotrigger and the trigger-character bookkeeping.
+--- Keeping the buffer-word source out of it means (a) those LSP paths never
+--- silently grow buffer-word results, and (b) their behavior cannot depend on
+--- whether a CTRL-N happened to be pressed earlier in the buffer. The builtin
+--- client is routed to exclusively by _builtin_trigger() below and excluded
+--- by name in _omnifunc().
+--- @param bufnr integer
+--- @return vim.lsp.Client?
+function M._ensure_builtin_server(bufnr)
+  local client = get_builtin_client(bufnr)
+  if client then
+    return client
+  end
+
+  local server = require('vim.lsp.completion.server')
+  -- silent: a failed start must not open a message prompt in the middle of an
+  -- Insert-mode keystroke; the caller logs the absence instead.
+  local client_id = lsp.start({
+    name = BUILTIN_SERVER_NAME,
+    cmd = server.cmd,
+  }, { bufnr = bufnr, silent = true })
+
+  return client_id and lsp.get_client_by_id(client_id) or nil
+end
+
+--- Triggers builtin completion once in the current buffer, starting the
+--- in-process buffer-word server first if needed. This is the entry point
+--- called from the C insert-completion code (CTRL-N / CTRL-X CTRL-N).
+---
+--- @param local_only? boolean Restrict the scan to the current buffer:
+--- `true` for CTRL-X CTRL-N; `false`/`nil` for CTRL-N (also scans other buffers).
+--- @param backward? boolean CTRL-P: select the nearest match above (last item).
+--- @param mode? string Source mode
+--- ("keyword"/"files"/"lines"/"dictionary"/"thesaurus"/"tags"/"includes"/
+--- "defines"/"cmdline"/"register").
+--- ADDING continuation rounds (|complete_ADDING|) never come through here:
+--- they stay on the native collector (routing gate in ins_complete()); the
+--- session bridge is the CONT_N_ADDS seed in set_completion() plus
+--- cont_s_ipos read back in ins_compl_add_tv(). This includes repeated
+--- CTRL-X CTRL-R rounds (register completion has a native adding mode).
+--- @param startcol? integer 0-based byte column where the base starts, for
+--- sources whose boundary is computed by a C engine the server cannot reach:
+--- currently "cmdline" (set_cmd_context()). Negative or nil means "not
+--- applicable".
+function M._builtin_trigger(local_only, backward, mode, startcol)
+  local bufnr = api.nvim_get_current_buf()
+  -- Attaching the in-process server (lsp.start: client creation, buffer
+  -- attach, LspAttach autocmds, the initialize handshake) is lifecycle work
+  -- and runs from the InsertEnter autocmd (see runtime/plugin), i.e. in a
+  -- safe context *before* any completion key. This call is only a best-effort
+  -- fallback for buffers that were already in Insert mode when the plugin
+  -- loaded; a failure here must not kill the trigger.
+  local ensure_ok, client = pcall(M._ensure_builtin_server, bufnr)
+  if not ensure_ok then
+    log.warn(('builtin ensure failed: %s'):format(tostring(client)))
+    client = get_builtin_client(bufnr)
+  end
+  if not client then
+    -- Nothing sensible to route to; applying an empty session instead would
+    -- flash completion state for what is really a startup failure.
+    log.warn('builtin trigger dropped: no in-process client')
+    return
+  end
+
+  --- @type vim.lsp.completion._server.Context
+  local ctx = {
+    triggerKind = protocol.CompletionTriggerKind.Invoked,
+    local_only = local_only,
+    -- C passes an empty string for the default keyword source, and '' is
+    -- truthy in Lua: without normalization it reaches nvim__complete(),
+    -- where ins_compl_append() maps an unrecognized mode to CTRL_X_EVAL --
+    -- which skips the CONT_N_ADDS seed in set_completion() and breaks the
+    -- whole adding chain (^X never turns it into CONT_INTRPT).
+    mode = (mode ~= '' and mode) or 'keyword',
+    backward = backward,
+    -- C sends -1 for "no precomputed column" (nlua_exec cannot omit
+    -- positional args); normalize to nil so collectors can `or` a default.
+    startcol = (type(startcol) == 'number' and startcol >= 0) and startcol or nil,
+  }
+
+  -- Route builtin CTRL-X requests to the in-process server only. The buffer's
+  -- other LSP clients must not see them: their ordinary completion responses
+  -- would be merged into e.g. a filename (^X^F) or dictionary (^X^K) session,
+  -- and the private context fields (mode/local_only/backward) mean nothing to
+  -- them. Whether plain CTRL-N should also consult external LSP servers is a
+  -- 'complete' policy question for the collector, not something to decide by
+  -- broadcasting here.
+  trigger(bufnr, { [client.id] = client }, ctx)
+end
+
 --- Implements 'omnifunc' compatible LSP completion.
 ---
 --- @see |complete-functions|
@@ -1284,7 +1502,13 @@ end
 function M._omnifunc(findstart, base)
   lsp.log.debug('omnifunc.findstart', { findstart = findstart, base = base })
   local bufnr = api.nvim_get_current_buf()
-  local clients = lsp.get_clients({ bufnr = bufnr, method = 'textDocument/completion' })
+  -- Exclude the builtin buffer-word client: it advertises
+  -- textDocument/completion like any server, but ^X^O is omni/LSP completion;
+  -- buffer words leaking into it would change documented behavior, and only
+  -- after the builtin client happens to have been attached by a CTRL-N.
+  local clients = vim.tbl_filter(function(client)
+    return client.name ~= BUILTIN_SERVER_NAME
+  end, lsp.get_clients({ bufnr = bufnr, method = 'textDocument/completion' }))
   local remaining = #clients
   if remaining == 0 then
     return findstart == 1 and -1 or {}

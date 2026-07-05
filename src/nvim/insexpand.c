@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "klib/kvec.h"
+#include "nvim/api/private/defs.h"
 #include "nvim/api/private/helpers.h"
 #include "nvim/ascii_defs.h"
 #include "nvim/autocmd.h"
@@ -353,6 +354,7 @@ static int cpt_sources_index = -1;
 // popup menu.  It is NULL when there is no popup menu.
 static pumitem_T *compl_match_array = NULL;
 static int compl_match_arraysize;
+static int compl_session_id = 0;
 
 /// CTRL-X pressed in Insert mode.
 void ins_ctrl_x(void)
@@ -3373,6 +3375,12 @@ static int ins_compl_add_tv(typval_T *const tv, const Direction dir, bool fast)
         && tv_dict_get_number(tv->vval.v_dict, "equal")) {
       flags |= CP_EQUAL;
     }
+    // Set by the in-process buffer-word server on adding-mode items that
+    // joined a word from the next line, so the CONT_S_IPOS -> CONT_SOL chain
+    // in ins_complete()/ins_compl_continue_search() keeps working.
+    if (tv_dict_get_number(tv->vval.v_dict, "cont_s_ipos")) {
+      flags |= CP_CONT_S_IPOS;
+    }
   } else {
     word = tv_get_string_chk(tv);
     CLEAR_FIELD(cptext);
@@ -3382,8 +3390,35 @@ static int ins_compl_add_tv(typval_T *const tv, const Direction dir, bool fast)
     tv_clear(&user_data);
     return FAIL;
   }
+  // Built-in word completion sources (keyword, whole-line, dictionary) now scan
+  // in the in-process Lua server, which bypasses ins_compl_add_infercase(). Re-
+  // apply 'infercase' here so a match like "HELLO" for typed "HEL" is inferred
+  // to the typed case, mirroring the native paths that all pass words through
+  // ins_compl_add_infercase(p_ic). Excluded: complete() (CTRL_X_EVAL) passes
+  // items verbatim, and filename completion (CTRL_X_FILES) must not case-fold
+  // paths.
+  char *infercase_tofree = NULL;
+  if (!ctrl_x_mode_eval() && !ctrl_x_mode_files()
+      && p_ic && curbuf->b_p_inf
+      && compl_orig_text.data != NULL && *word != NUL) {
+    int char_len = 0;
+    for (const char *cp = word; *cp != NUL;) {
+      MB_PTR_ADV(cp);
+      char_len++;
+    }
+    int compl_char_len = 0;
+    for (const char *cp = compl_orig_text.data; *cp != NUL;) {
+      MB_PTR_ADV(cp);
+      compl_char_len++;
+    }
+    if (compl_char_len > 0) {
+      word = ins_compl_infercase_gettext(word, char_len, compl_char_len,
+                                         MIN(char_len, compl_char_len), &infercase_tofree);
+    }
+  }
   int status = ins_compl_add((char *)word, -1, NULL, cptext, true,
                              &user_data, dir, flags, dup, user_hl, FUZZY_SCORE_NONE, preselect);
+  xfree(infercase_tofree);
   if (status != OK) {
     tv_clear(&user_data);
   }
@@ -3447,13 +3482,27 @@ static void restore_orig_extmarks(void)
 ///
 /// @param startcol  where the matched text starts (1 is first column).
 /// @param list      the list of matches.
-static void set_completion(colnr_T startcol, list_T *list)
+static void set_completion(colnr_T startcol, list_T *list, int mode, bool backward)
 {
   int flags = CP_ORIGINAL_TEXT;
   unsigned cur_cot_flags = get_cot_flags();
   bool compl_longest = (cur_cot_flags & kOptCotFlagLongest) != 0;
   bool compl_no_insert = (cur_cot_flags & kOptCotFlagNoinsert) != 0;
   bool compl_no_select = (cur_cot_flags & kOptCotFlagNoselect) != 0;
+
+  // A backspace past the found matches redoes the search (ins_compl_bs() ->
+  // ins_compl_new_leader() -> ins_complete() -> Lua collect -> back here).
+  // Native sets "compl_restarting" so the redone search does not insert the
+  // first match over the shortened leader; honor it like a noinsert session.
+  if (compl_restarting) {
+    compl_no_insert = true;
+  }
+
+  // The session locality (CTRL-X CTRL-N/CTRL-P set CONT_LOCAL in
+  // ins_compl_prep()/set_ctrl_x_mode()) must survive into the adding-bridge
+  // seed below exactly as a native session would carry it, but the
+  // stop/clear right here resets compl_cont_status -- capture it first.
+  const int had_local = compl_cont_status & CONT_LOCAL;
 
   // If already doing completions stop it.
   if (compl_started || ctrl_x_mode_not_default()) {
@@ -3483,30 +3532,79 @@ static void set_completion(colnr_T startcol, list_T *list)
     return;
   }
 
-  ctrl_x_mode = CTRL_X_EVAL;
+  ctrl_x_mode = mode;
 
   ins_compl_add_list(list);
   compl_matches = ins_compl_make_cyclic();
   compl_started = true;
   compl_used_match = true;
-  compl_cont_status = 0;
+  // compl_cont_status = 0;
+  // Seed the bridge state the native adding path (CONT_ADDING) expects, so a
+  // following CTRL-X CTRL-N / CTRL-X CTRL-L / CTRL-X CTRL-I / CTRL-X CTRL-D /
+  // CTRL-X CTRL-R continues in C from where the Lua batch left off (see
+  // ins_compl_continue_search() for the modes with an adding round);
+  // complete() (CTRL_X_EVAL) does not have one.
+  if (mode != CTRL_X_EVAL) {
+    // Native ins_compl_start() marks every fresh round with CONT_N_ADDS and
+    // records its mode, whatever the source; that is what lets a following
+    // ^X become CONT_INTRPT in ins_ctrl_x(), driving both the same-mode
+    // adding continuation and the documented cross-mode interrupt semantics
+    // (ins_compl_prep()'s ^N/^P case drops CONT_LOCAL when interrupting a
+    // non-NORMAL mode: "do normal expansion when interrupting a different
+    // mode").
+    compl_cont_mode = mode;
+    // Non-NORMAL modes drop CONT_LOCAL exactly like the native fresh path
+    // ("Remove LOCAL if ctrl_x_mode != CTRL_X_NORMAL"); for NORMAL keep it
+    // so a continuation round of ^X^N/^X^P stays restricted to the current
+    // buffer (without it the native scan uses 'complete' as-is, e.g. cpt=t
+    // would search tags only).
+    compl_cont_status = CONT_N_ADDS
+                        | (mode == CTRL_X_NORMAL ? had_local : 0);
+    if (mode == CTRL_X_NORMAL || mode == CTRL_X_WHOLE_LINE
+        || mode == CTRL_X_PATH_DEFINES || mode == CTRL_X_PATH_PATTERNS) {
+      // The continuation anchor is consumed by every mode with a native
+      // adding continuation (see ins_compl_continue_search()): keyword,
+      // whole-line, and the includes/defines pair -- the CONT_S_IPOS ->
+      // CONT_SOL word-walk of repeated ^X^D derives its column from it
+      // (skipwhite(line + compl_length + compl_startpos.col)). Without the
+      // anchor the second ^X^D of a define chain scans from a stale column
+      // and finds nothing.
+      compl_startpos = (pos_T){ .lnum = compl_lnum, .col = compl_col };
+    }
+  } else {
+    compl_cont_status = 0;
+  }
+  WLOG("BUILTIN set_completion: mode=%d cont=0x%x col=%d n=%d",
+       mode, (unsigned)compl_cont_status, (int)compl_col, compl_matches);
   int save_w_wrow = curwin->w_wrow;
   int save_w_leftcol = curwin->w_leftcol;
 
   compl_curr_match = compl_first_match;
   bool no_select = compl_no_select || compl_longest;
+  // Identifier-style sources (tags, dictionary, thesaurus) pre-insert the
+  // first match exactly like keyword/whole-line/filename completion: native
+  // ^X^] / ^X^K / ^X^T insert it up front (ins_compl_use_match() is true for
+  // those trigger keys), and chains such as Test_ins_complete's "tag
+  // expansion, define add-expansion interrupted" depend on the inserted tag
+  // as the base of the following ^X^D round.
   if (compl_preselect_match && !no_select) {
     compl_curr_match = compl_preselect_match->cp_prev;
     ins_complete(Ctrl_N, false);
   } else if (compl_no_insert || no_select) {
-    ins_complete(K_DOWN, false);
+    // K_DOWN selects (without inserting) the list head; a BACKWARD trigger's
+    // initial selection is the nearest match above the cursor = the list
+    // tail (see the found-order contract in the Lua server), which K_UP
+    // reaches from the unselected state (Test_complete_local_expansion's
+    // noinsert "interrupt" case pins it).
+    ins_complete(backward ? K_UP : K_DOWN, false);
     if (no_select) {
-      ins_complete(K_UP, false);
+      ins_complete(backward ? K_DOWN : K_UP, false);
     }
   } else {
-    ins_complete(Ctrl_N, false);
+    ins_complete(backward ? Ctrl_P : Ctrl_N, false);
   }
   compl_enter_selects = compl_no_insert;
+
 
   // Lazily show the popup menu, unless we got interrupted.
   if (!compl_interrupted) {
@@ -3536,7 +3634,7 @@ void f_complete(typval_T *argvars, typval_T *rettv, EvalFuncData fptr)
   } else {
     const colnr_T startcol = (colnr_T)tv_get_number_chk(&argvars[0], NULL);
     if (startcol > 0) {
-      set_completion(startcol - 1, argvars[1].vval.v_list);
+      set_completion(startcol - 1, argvars[1].vval.v_list, CTRL_X_EVAL, false);
     }
   }
 }
@@ -5810,22 +5908,34 @@ static int get_filename_compl_info(char *line, int startcol, colnr_T curs_col)
 
 /// Get the pattern, column and length for command-line completion.
 /// Sets the global variables: compl_col, compl_length and compl_pattern.
+/// Start column (0-based byte) of the command-line completion pattern in
+/// "str" (the command line, "len" bytes, cursor at "col"): where
+/// set_cmd_context() puts xp_pattern, with the EXPAND_LUA hop applied and
+/// the EXPAND_UNSUCCESSFUL/EXPAND_NOTHING cases falling back to the cursor
+/// column. Shared by the session path (get_cmdline_compl_info()) and the
+/// routing-gate probe (builtin_cmdline_startcol()) so the boundary logic
+/// lives in one place. "xp" is filled as a side effect: the session path
+/// keeps it (compl_xp, consumed by get_next_cmdline_completion()), the
+/// probe discards its private one.
+static colnr_T cmdline_compl_startcol(expand_T *xp, char *str, int len, colnr_T col)
+{
+  set_cmd_context(xp, str, len, col, false);
+  if (xp->xp_context == EXPAND_LUA) {
+    nlua_expand_pat(xp);
+  }
+  if (xp->xp_context == EXPAND_UNSUCCESSFUL || xp->xp_context == EXPAND_NOTHING) {
+    // No completion possible, an empty pattern gets the
+    // "pattern not found" message.
+    return col;
+  }
+  return (colnr_T)(xp->xp_pattern - str);
+}
+
 static int get_cmdline_compl_info(char *line, colnr_T curs_col)
 {
   compl_pattern = cbuf_to_string(line, (size_t)curs_col);
-  set_cmd_context(&compl_xp, compl_pattern.data,
-                  (int)compl_pattern.size, curs_col, false);
-  if (compl_xp.xp_context == EXPAND_LUA) {
-    nlua_expand_pat(&compl_xp);
-  }
-  if (compl_xp.xp_context == EXPAND_UNSUCCESSFUL
-      || compl_xp.xp_context == EXPAND_NOTHING) {
-    // No completion possible, use an empty pattern to get a
-    // "pattern not found" message.
-    compl_col = curs_col;
-  } else {
-    compl_col = (int)(compl_xp.xp_pattern - compl_pattern.data);
-  }
+  compl_col = cmdline_compl_startcol(&compl_xp, compl_pattern.data,
+                                     (int)compl_pattern.size, curs_col);
   compl_length = curs_col - compl_col;
 
   return OK;
@@ -6260,11 +6370,181 @@ static void ins_compl_show_statusmsg(void)
   }
 }
 
+
+/// Start column (0-based byte) the command-line completion base would get,
+/// i.e. exactly the compl_col that get_cmdline_compl_info() would compute --
+/// the boundary logic itself is shared with it (cmdline_compl_startcol()).
+/// This probe only differs in lifetime: it runs BEFORE routing to the Lua
+/// collector, when no C session will start, so it must not touch the session
+/// globals get_cmdline_compl_info() fills. compl_pattern would be assigned
+/// without freeing the previous value (native relies on the session teardown
+/// for that), and compl_xp would be parked with xp_pattern pointing into a
+/// buffer the next session frees. Hence a private copy of the line
+/// (set_cmd_context() temporarily NUL-terminates its argument at the cursor;
+/// the session path copies too, into compl_pattern) and a local expand_T,
+/// cleaned up right here. The expansion itself happens in the Lua collector
+/// via getcompletion(..., "cmdline"), which drives the same
+/// set_cmd_context() + ExpandFromContext() pair.
+static colnr_T builtin_cmdline_startcol(void)
+{
+  colnr_T curs_col = curwin->w_cursor.col;
+  char *pattern = xstrnsave(get_cursor_line_ptr(), (size_t)curs_col);
+  expand_T xp;
+  ExpandInit(&xp);
+  colnr_T col = cmdline_compl_startcol(&xp, pattern, (int)curs_col, curs_col);
+  ExpandCleanup(&xp);
+  xfree(pattern);
+  return col;
+}
+
 /// Do Insert mode completion.
 /// Called when character "c" was typed, which has a meaning for completion.
 /// Returns OK if completion was done, FAIL if something failed.
 int ins_complete(int c, bool enable_pum)
 {
+  // Built-in completion sources that now run in the in-process Lua server
+  // instead of the synchronous C scan. Both fire only on a fresh session (not
+  // while navigating the popup, where compl_started is set); results come back
+  // via nvim__complete() -> ins_compl_append() -> set_completion(), which fixes
+  // the start column, selection and completeopt and sets complete_info().mode.
+  //
+  //   - Keyword (CTRL-N / CTRL-X CTRL-N): CTRL-X CTRL-N (CONT_LOCAL) restricts
+  //     to the current buffer, plain CTRL-N follows 'complete' across buffers.
+  //     A repeated ^X^N/^X^P after accepting a match (CONT_INTRPT with the
+  //     same cont_mode) becomes an ADDING round (|complete_ADDING|) and stays
+  //     fully native: ins_compl_start() runs its own continue-search fixup
+  //     and scan. The bridge from a Lua-collected first round is state only
+  //     (the seed in set_completion(), cont_s_ipos in ins_compl_add_tv()).
+  //   - Filename (CTRL-X CTRL-F): a standalone ctrl_x mode (no multi-source
+  //     merge to preserve); the server expands paths via getcompletion().
+  //   - Whole line (CTRL-X CTRL-L): matches entire lines across the same
+  //     buffers as keyword completion, keyed off the line's indent.
+  //   - Dictionary (CTRL-X CTRL-K): words from the 'dictionary' files; like
+  //     files it is a standalone mode with no adding continuation.
+  //   - Thesaurus (CTRL-X CTRL-T): synonyms from the 'thesaurus' files; every
+  //     word on a matching line is offered. Also a standalone mode.
+  //   - Tags (CTRL-X CTRL-]): tag names from the 'tags' files via find_tags().
+  //     Standalone mode, no adding continuation.
+  //   - Command line (CTRL-X CTRL-V, and CTRL-X typed in that mode): the base
+  //     boundary is probed here with set_cmd_context() (see
+  //     builtin_cmdline_startcol()) and passed along; the server expands via
+  //     getcompletion(..., "cmdline"), the same engine pair as
+  //     get_next_cmdline_completion().
+  //   - Registers (CTRL-X CTRL-R): \k words from the yank registers; the
+  //     base is the keyword before the cursor, like keyword completion.
+  //     Repeated ^X^R is an ADDING round and stays native (see below).
+  //
+  // The Lua entrypoint is the same; only local_only/backward/mode and the
+  // precomputed cmdline base column differ.
+  //
+  // Sessions the server does not implement stay on the native collector:
+  //   - 'autocomplete': its timer/preinsert/longest state machine lives in C;
+  //   - CTRL-X s (spell): TODO(builtin-completion), still native;
+  //   - user functions as a mode: CTRL-X CTRL-U ('completefunc'), CTRL-X
+  //     CTRL-O ('omnifunc'), CTRL-X CTRL-T with 'thesaurusfunc', and
+  //     complete() (CTRL_X_EVAL) -- LSP omni rides
+  //     vim.lsp.completion._omnifunc instead.
+  // All other fresh collection lives in Lua -- the native scanners are being
+  // removed, so every routed source routes unconditionally; there is no
+  // native fallback to defer to. 'completeopt' semantics are the collector's
+  // job: fuzzy gathering and "nearest" ordering are implemented on the Lua
+  // side (fuzzy+longest and whole-line "nearest" ordering are open TODOs
+  // there). An active 'autocomplete' session is superseded like any other:
+  // the apply path (set_completion() -> ins_compl_prep(' ')) stops it first.
+  const bool do_keyword = ctrl_x_mode_normal();
+  const bool do_files = ctrl_x_mode_files();
+  const bool do_lines = ctrl_x_mode_whole_line();
+  const bool do_dict = ctrl_x_mode_dictionary();
+  const bool do_thes = ctrl_x_mode_thesaurus() && !thesaurus_func_complete(ctrl_x_mode);
+  const bool do_tags = ctrl_x_mode_tags();
+  const bool do_incl = ctrl_x_mode_path_patterns();
+  const bool do_defines = ctrl_x_mode_path_defines();
+  // Covers CTRL_X_CMDLINE and CTRL_X_CMDLINE_CTRL_X; a fresh session only
+  // ever sees the former (mode 17 arises inside a running session, which the
+  // gate below skips), so the src_mode string maps back to CTRL_X_CMDLINE.
+  const bool do_cmdline = ctrl_x_mode_cmdline();
+  const bool do_register = ctrl_x_mode_register();
+  // ADDING continuation (|complete_ADDING|): a previous keyword/whole-line
+  // session in the same mode was interrupted (^X after accepting a match).
+  // It stays fully native: ins_compl_start() runs its own continue-search
+  // fixup (compl_startpos/compl_col/compl_length, CONT_SOL derivation,
+  // empty-base degradation to a plain new completion) and the native scan
+  // collects the extended-base candidates. The bridge from a Lua-collected
+  // first round is state only: set_completion() seeds CONT_N_ADDS /
+  // compl_cont_mode / compl_startpos so ins_ctrl_x() turns the ^X into
+  // CONT_INTRPT, and ins_compl_add_tv() reads cont_s_ipos back from the Lua
+  // items so the CONT_S_IPOS -> CONT_SOL chain keeps working.
+  // Includes/defines share the native adding continuation with keyword and
+  // whole-line: ins_compl_continue_search() handles exactly these classes
+  // (the CONT_S_IPOS -> CONT_SOL word-walk of ^X^D depends on it). Registers
+  // are the remaining class with an adding round (get_register_completion()'s
+  // compl_status_adding() branch, driven by the same continue-search): a
+  // repeated ^X^R therefore stays native too.
+  const bool adding_continuation = (do_keyword || do_lines || do_incl || do_defines
+                                    || do_register)
+                                   && (compl_cont_status & CONT_INTRPT) == CONT_INTRPT
+                                   && compl_cont_mode == ctrl_x_mode;
+  if (adding_continuation) {
+    WLOG("BUILTIN adding-continuation: cxm=%d cont=0x%x -> native continue_search",
+         ctrl_x_mode, (unsigned)compl_cont_status);
+  }
+  if (!compl_started && !adding_continuation
+      && (do_keyword || do_files || do_lines || do_dict || do_thes || do_tags
+          || do_incl || do_defines || do_cmdline || do_register)) {
+    // Interrupting a *different* mode starts a fresh session (native
+    // ins_compl_start() keeps only CONT_LOCAL in that case).
+    if (compl_cont_status & CONT_INTRPT) {
+      compl_cont_status &= CONT_LOCAL;
+    }
+    String src_mode = (String)STRING_INIT;  // keyword: Lua defaults to "keyword"
+    if (do_files) {
+      src_mode = STATIC_CSTR_AS_STRING("files");
+    } else if (do_lines) {
+      src_mode = STATIC_CSTR_AS_STRING("lines");
+    } else if (do_dict) {
+      src_mode = STATIC_CSTR_AS_STRING("dictionary");
+    } else if (do_thes) {
+      src_mode = STATIC_CSTR_AS_STRING("thesaurus");
+    } else if (do_tags) {
+      src_mode = STATIC_CSTR_AS_STRING("tags");
+    } else if (do_incl) {
+      src_mode = STATIC_CSTR_AS_STRING("includes");
+    } else if (do_defines) {
+      src_mode = STATIC_CSTR_AS_STRING("defines");
+    } else if (do_cmdline) {
+      src_mode = STATIC_CSTR_AS_STRING("cmdline");
+    } else if (do_register) {
+      src_mode = STATIC_CSTR_AS_STRING("register");
+    }
+    // Base-boundary hint for cmdline, whose boundary lives in a C engine the
+    // Lua server cannot call (set_cmd_context()). -1 = not applicable; the
+    // other sources derive their base themselves.
+    Integer startcol = do_cmdline ? (Integer)builtin_cmdline_startcol() : -1;
+    MAXSIZE_TEMP_ARRAY(args, 4);
+    ADD_C(args, BOOLEAN_OBJ(do_keyword && compl_status_local()));
+    // Keyword and whole-line honor the direction of the trigger key (e.g.
+    // CTRL-L and CTRL-P search backward), which sets the initial selection;
+    // files has no backward variant, and CTRL-R is always a FORWARD key
+    // (ins_compl_key2dir()).
+    ADD_C(args, BOOLEAN_OBJ((do_keyword || do_lines) && ins_compl_key2dir(c) == BACKWARD));
+    ADD_C(args, STRING_OBJ(src_mode));
+    ADD_C(args, INTEGER_OBJ(startcol));
+    WLOG("BUILTIN route: cxm=%d cont=0x%x started=%d mode=%s",
+         ctrl_x_mode, (unsigned)compl_cont_status, compl_started,
+         src_mode.data != NULL ? src_mode.data : "keyword");
+    WLOG("BUILTIN rtp=%s", p_rtp != NULL ? p_rtp : "NULL");
+    Error err = ERROR_INIT;
+    (void)nlua_exec(STATIC_CSTR_AS_STRING("vim.lsp.completion._builtin_trigger(...)"),
+                    NULL, args, kRetNilBool, NULL, &err);
+    if (ERROR_SET(&err)) {
+      // An error here means the whole trigger chain died before any request
+      // was sent -- externally indistinguishable from "no response". Log it
+      // instead of swallowing it so async failures stay diagnosable.
+      ELOG("BUILTIN trigger failed: %s", err.msg);
+    }
+    api_clear_error(&err);
+    return OK;
+  }
   const bool disable_ac_delay = compl_started && ctrl_x_mode_normal()
                                 && (c == Ctrl_N || c == Ctrl_P || c == Ctrl_R
                                     || ins_compl_pum_key(c));
@@ -6701,4 +6981,119 @@ void f_preinserted(typval_T *argvars, typval_T *rettv, EvalFuncData fptr)
   if (ins_compl_preinsert_effect()) {
     rettv->vval.v_number = 1;
   }
+}
+
+/// Append matches to an external completion session, or start a new one.
+///
+/// For async sources that return in several batches (e.g. multiple LSP servers
+/// where a slow one must not block a fast one): the first batch starts a
+/// session and gets a fresh id; later batches append by passing that id. A
+/// batch whose id does not match the current session is rejected, so a slow
+/// source's late results cannot leak into a newer session.
+///
+/// The first batch goes through set_completion, so the completion state machine
+/// is initialised exactly as for complete() and the popup is stable. Later
+/// batches only extend the list and rebuild the popup, leaving the user's
+/// current selection untouched (matches are kept in arrival order, not
+/// re-sorted).
+///
+/// @param startcol     0-based column where the completion starts (used only
+///                     when starting a new session).
+/// @param list         matches to add (same item shape as complete()).
+/// @param session_id   0 to start a new session; otherwise the id of the
+///                     session to append to.
+/// @return  the (new or current) session id on success, or -1 if the append
+///          was rejected because session_id does not identify the live
+///          session (wrong id, or no session is active).
+///
+/// TODO(builtin-completion): compl_session_id is only advanced when a new
+/// session starts here; it is not invalidated when a session ends through the
+/// native teardown paths (ins_compl_stop()/ins_compl_restart()). A batch
+/// holding the last id could thus append into a *native* session started
+/// afterwards (currently only adding-continuation rounds). In practice the
+/// Lua-side changedtick guard drops such batches first (accepting a match
+/// changes the tick), but once this API gets external async callers the id
+/// should be invalidated in the teardown paths themselves.
+int ins_compl_append(colnr_T startcol, list_T *list, int session_id, String mode, bool backward)
+{
+  // A nonzero id identifies the session to append to, so it must be the live
+  // one: reject a wrong id, and also reject when no session is active anymore
+  // (the target session ended). Falling through to "start a new session" in
+  // the latter case would pass the append path's dummy startcol (-1) into
+  // set_completion() as compl_col and read before the line start.
+  if (session_id != 0 && (!compl_started || session_id != compl_session_id)) {
+    return -1;
+  }
+  bool start_new = (session_id == 0);
+  WLOG("BUILTIN append: session=%d start_new=%d n=%d col=%d mode=%s backward=%d",
+       session_id, start_new, (int)tv_list_len(list), (int)startcol,
+       mode.data != NULL ? mode.data : "", backward);
+
+  if (start_new) {
+    // Map the requested source to a CTRL-X mode; an unknown or absent mode
+    // drives the generic CTRL_X_EVAL path (complete()). The names must stay in
+    // sync with the src_mode strings sent from ins_complete()'s routing block
+    // and the `collectors` table in runtime/lua/vim/lsp/completion/server.lua.
+    // The CTRL-X mode is what makes set_completion() seed the native adding
+    // bridge (compl_cont_mode/compl_startpos) and complete_info() report the
+    // right mode, so a missing entry here silently breaks both.
+    static const struct {
+      const char *name;
+      size_t len;
+      int cx_mode;
+    } mode_map[] = {
+      { S_LEN("keyword"), CTRL_X_NORMAL },
+      { S_LEN("files"), CTRL_X_FILES },
+      { S_LEN("lines"), CTRL_X_WHOLE_LINE },
+      { S_LEN("dictionary"), CTRL_X_DICTIONARY },
+      { S_LEN("thesaurus"), CTRL_X_THESAURUS },
+      { S_LEN("tags"), CTRL_X_TAGS },
+      { S_LEN("includes"), CTRL_X_PATH_PATTERNS },
+      { S_LEN("defines"), CTRL_X_PATH_DEFINES },
+      // A fresh gate routing only ever sends "cmdline" for CTRL_X_CMDLINE
+      // (mode 17 arises inside a running session); a following ^X in the
+      // session then moves 11 -> 17 natively, as before.
+      { S_LEN("cmdline"), CTRL_X_CMDLINE },
+      // Register keeps its native adding continuation: set_completion() seeds
+      // compl_cont_mode below, and ins_compl_continue_search() turns the next
+      // ^X^R into a CONT_ADDING round on the native collector.
+      { S_LEN("register"), CTRL_X_REGISTER },
+    };
+    int mode_val = CTRL_X_EVAL;
+    for (size_t i = 0; i < ARRAY_SIZE(mode_map); i++) {
+      if (mode.size == mode_map[i].len
+          && memcmp(mode.data, mode_map[i].name, mode_map[i].len) == 0) {
+        mode_val = mode_map[i].cx_mode;
+        break;
+      }
+    }
+    // Delegate to set_completion so the state machine (selection, pum, ctrl-x
+    // mode) is set up exactly as for complete(). This keeps the popup stable;
+    // re-implementing it partially is what made the menu flicker and vanish.
+    set_completion(startcol, list, mode_val, backward);
+    compl_session_id++;
+    return compl_session_id;
+  }
+
+  // Append to the running session. The list already exists and is active; we
+  // only extend it and rebuild the popup, without advancing the state machine,
+  // so the user's current selection is preserved.
+  ins_compl_add_list(list);
+  compl_matches = ins_compl_make_cyclic();
+
+  // Force the popup array to be rebuilt from the now-longer list on the next
+  // show; ins_compl_show_pum rebuilds when compl_match_array == NULL. The
+  // selection (compl_shown_match / compl_curr_match) is left as-is.
+  XFREE_CLEAR(compl_match_array);
+  compl_match_arraysize = 0;
+
+  int save_w_wrow = curwin->w_wrow;
+  int save_w_leftcol = curwin->w_leftcol;
+  if (!compl_interrupted) {
+    show_pum(save_w_wrow, save_w_leftcol);
+  }
+
+  may_trigger_modechanged();
+  ui_flush();
+  return compl_session_id;
 }

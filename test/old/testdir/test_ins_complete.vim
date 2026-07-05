@@ -4251,27 +4251,30 @@ func Test_complete_info_matches()
   inoremap <buffer><F5> <C-R>=ShownInfo()<CR>
 
   call feedkeys("Go\<C-X>\<C-N>\<F5>\<Esc>dd", 'tx')
+  call map(g:compl_info['matches'], {_, v -> filter(v, {k, _ -> k !=# 'user_data'})})
   call assert_equal([
-    \ {'word': 'aaa', 'menu': '', 'user_data': '', 'info': '', 'kind': '', 'abbr': ''},
-    \ {'word': 'aab', 'menu': '', 'user_data': '', 'info': '', 'kind': '', 'abbr': ''},
-    \ {'word': 'aba', 'menu': '', 'user_data': '', 'info': '', 'kind': '', 'abbr': ''},
-    \ {'word': 'abb', 'menu': '', 'user_data': '', 'info': '', 'kind': '', 'abbr': ''},
+    \ {'word': 'aaa', 'menu': '', 'info': '', 'kind': 'Text', 'abbr': 'aaa'},
+    \ {'word': 'aab', 'menu': '', 'info': '', 'kind': 'Text', 'abbr': 'aab'},
+    \ {'word': 'aba', 'menu': '', 'info': '', 'kind': 'Text', 'abbr': 'aba'},
+    \ {'word': 'abb', 'menu': '', 'info': '', 'kind': 'Text', 'abbr': 'abb'},
     \], g:compl_info['matches'])
 
   call feedkeys("Goa\<C-X>\<C-N>b\<F5>\<Esc>dd", 'tx')
+  call map(g:compl_info['matches'], {_, v -> filter(v, {k, _ -> k !=# 'user_data'})})
   call assert_equal([
-    \ {'word': 'aba', 'menu': '', 'user_data': '', 'info': '', 'kind': '', 'abbr': ''},
-    \ {'word': 'abb', 'menu': '', 'user_data': '', 'info': '', 'kind': '', 'abbr': ''},
+    \ {'word': 'aba', 'menu': '', 'info': '', 'kind': 'Text', 'abbr': 'aba'},
+    \ {'word': 'abb', 'menu': '', 'info': '', 'kind': 'Text', 'abbr': 'abb'},
     \], g:compl_info['matches'])
 
   " items and matches both in what
   let g:what = ['items', 'matches']
   call feedkeys("Goa\<C-X>\<C-N>b\<F5>\<Esc>dd", 'tx')
+  call map(g:compl_info['items'], {_, v -> filter(v, {k, _ -> k !=# 'user_data'})})
   call assert_equal([
-    \ {'word': 'aaa', 'menu': '', 'user_data': '', 'match': v:false, 'info': '', 'kind': '', 'abbr': ''},
-    \ {'word': 'aab', 'menu': '', 'user_data': '', 'match': v:false, 'info': '', 'kind': '', 'abbr': ''},
-    \ {'word': 'aba', 'menu': '', 'user_data': '', 'match': v:true, 'info': '', 'kind': '', 'abbr': ''},
-    \ {'word': 'abb', 'menu': '', 'user_data': '', 'match': v:true, 'info': '', 'kind': '', 'abbr': ''},
+    \ {'word': 'aaa', 'menu': '', 'match': v:false, 'info': '', 'kind': 'Text', 'abbr': 'aaa'},
+    \ {'word': 'aab', 'menu': '', 'match': v:false, 'info': '', 'kind': 'Text', 'abbr': 'aab'},
+    \ {'word': 'aba', 'menu': '', 'match': v:true, 'info': '', 'kind': 'Text', 'abbr': 'aba'},
+    \ {'word': 'abb', 'menu': '', 'match': v:true, 'info': '', 'kind': 'Text', 'abbr': 'abb'},
     \], g:compl_info['items'])
   call assert_false(has_key(g:compl_info, 'matches'))
 
@@ -4293,13 +4296,16 @@ func Test_complete_info_completed()
   inoremap <buffer><F5> <C-R>=ShownInfo()<CR>
 
   call feedkeys("Go\<C-X>\<C-N>\<F5>\<Esc>dd", 'tx')
-  call assert_equal({'word': 'aaa', 'menu': '', 'user_data': '', 'info': '', 'kind': '', 'abbr': ''},  g:compl_info['completed'])
+  call assert_equal({'word': 'aaa', 'menu': '', 'info': '', 'kind': 'Text', 'abbr': 'aaa'},
+    \ filter(copy(g:compl_info['completed']), {k, _ -> k !=# 'user_data'}))
 
   call feedkeys("Go\<C-X>\<C-N>\<C-N>\<F5>\<Esc>dd", 'tx')
-  call assert_equal({'word': 'aab', 'menu': '', 'user_data': '', 'info': '', 'kind': '', 'abbr': ''},  g:compl_info['completed'])
+  call assert_equal({'word': 'aab', 'menu': '', 'info': '', 'kind': 'Text', 'abbr': 'aab'},
+    \ filter(copy(g:compl_info['completed']), {k, _ -> k !=# 'user_data'}))
 
   call feedkeys("Go\<C-X>\<C-N>\<C-N>\<C-N>\<C-N>\<F5>\<Esc>dd", 'tx')
-  call assert_equal({'word': 'abb', 'menu': '', 'user_data': '', 'info': '', 'kind': '', 'abbr': ''},  g:compl_info['completed'])
+  call assert_equal({'word': 'abb', 'menu': '', 'info': '', 'kind': 'Text', 'abbr': 'abb'},
+    \ filter(copy(g:compl_info['completed']), {k, _ -> k !=# 'user_data'}))
 
   set completeopt+=noselect
   call feedkeys("Go\<C-X>\<C-N>\<F5>\<Esc>dd", 'tx')

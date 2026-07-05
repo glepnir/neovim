@@ -84,6 +84,7 @@
 #include "nvim/terminal.h"
 #include "nvim/types_defs.h"
 #include "nvim/ui.h"
+#include "nvim/undo.h"
 #include "nvim/vim_defs.h"
 #include "nvim/window.h"
 
@@ -2581,4 +2582,106 @@ void nvim__redraw(Dict(redraw) *opts, Error *err)
 void nvim__set_restart_on_crash(String progpath, Array argv)
 {
   ui_call__set_restart_on_crash_exit(progpath, argv);
+}
+
+/// Set or append completion matches in the current completion session, and
+/// returns a session id.
+///
+/// Intended for in-process/async completion sources, such as several LSP
+/// servers whose results arrive separately: a slow source should not block a
+/// fast one. Omit `id` (or pass 0) to start a new session (this requires
+/// `col`), replacing any current matches; the returned id identifies that
+/// session. Pass that id back in `id` to append a later batch to the same
+/// session, keeping already-shown matches and the user's selection. Matches
+/// are kept in arrival order (not re-sorted).
+///
+/// A batch whose `id` does not match the active session is ignored (returns
+/// -1), so a slow source's late results cannot leak into a newer session.
+///
+/// @param opts  Parameters.
+///       - col: (integer) 1-based byte index where the completion starts (as
+///         for the {startcol} argument of |complete()|). Required when starting
+///         a new session; ignored when appending.
+///       - items: (Array) |complete-items| to set or append. Empty if omitted.
+///       - id: (integer) Session to append to, as returned by an earlier call
+///         (always >= 1). Omit or pass 0 to start a new session, so a caller
+///         can uniformly pass `id = session or 0`. Negative is an error.
+///       - mode: (string) Source mode: "keyword", "files", "lines",
+///         "dictionary", "thesaurus", "tags", "includes" or "defines".
+///         Anything else (or omitted) behaves like |complete()|.
+///       - backward: (boolean) Trigger key searches backward (CTRL-P,
+///         CTRL-X CTRL-L): the initial selection is the list tail.
+/// @param[out] err Error details, if any.
+/// @return Session id for the (new or current) session, or -1 if the batch was
+///         rejected for a stale id.
+Integer nvim__complete(Dict(complete_set) *opts, Error *err)
+  FUNC_API_SINCE(14)
+{
+  if ((State & MODE_INSERT) == 0) {
+    api_set_error(err, kErrorTypeException, "Can only be used in Insert mode");
+    return -1;
+  }
+  if (!undo_allowed(curbuf)) {
+    api_set_error(err, kErrorTypeException,
+                  "Cannot apply completion here (text locked or undo not allowed)");
+    return -1;
+  }
+
+  // A positive `id` selects append; omitting it, or passing 0 (which the
+  // insexpand layer reserves for "start a new session"), starts a new
+  // session -- so a streaming caller can uniformly pass its last returned id
+  // or 0. The distinction matters: forwarding `id = 0` down the *append*
+  // path would skip the `col` validation below and hand the dummy startcol
+  // (-1) to a new session, where set_completion() takes it as compl_col and
+  // reads before the line start. Negative ids are caller bugs and rejected
+  // loudly; positive-but-stale ids are not an error and return -1 per the
+  // contract above.
+  bool has_id = HAS_KEY(opts, complete_set, id);
+  if (has_id) {
+    VALIDATE_INT((opts->id >= 0), "id", opts->id, {
+      return -1;
+    });
+  }
+  bool appending = has_id && opts->id != 0;
+  Integer session_id = appending ? opts->id : 0;
+
+  // `col` locates where a new session starts; it is required for a new session
+  // and ignored when appending (the session already fixed its start column).
+  Integer col = 0;
+  if (!appending) {
+    VALIDATE((HAS_KEY(opts, complete_set, col)), "%s", "Required: 'col'", {
+      return -1;
+    });
+    col = opts->col;
+    VALIDATE_INT((col >= 1), "col", col, {
+      return -1;
+    });
+  }
+
+  // Convert the items Array (empty if not provided) to a list_T via the
+  // existing converter: its Array case builds and refs the list_T, even for an
+  // empty Array (yields an empty list, never NULL). take_luaref=false: items
+  // are owned by opts and freed by the API framework.
+  // An empty list is valid and means "no matches in this batch" (like passing
+  // an empty list to complete()); per-item validation happens in
+  // ins_compl_add_list, as it does for complete().
+  Object items_obj = ARRAY_OBJ(opts->items);
+  typval_T list_tv;
+  object_to_vim_take_luaref(&items_obj, &list_tv, false, err);
+  if (ERROR_SET(err)) {
+    return -1;
+  }
+
+  // Pass the source mode through to insexpand, which maps it to a CTRL-X mode
+  // ("keyword" -> CTRL_N/P scan, "files" -> CTRL-X CTRL-F). Absent mode yields
+  // an empty string, which insexpand treats as the generic complete() path.
+  String src_mode = HAS_KEY(opts, complete_set, mode) ? opts->mode : (String)STRING_INIT;
+  bool backward = HAS_KEY(opts, complete_set, backward) && opts->backward;
+  Integer ret = -1;
+  TRY_WRAP(err, {
+    ret = ins_compl_append((colnr_T)(col - 1), list_tv.vval.v_list, (int)session_id, src_mode, backward);
+  });
+
+  tv_clear(&list_tv);  // drops the ref taken by the converter
+  return ret;
 }

@@ -7,7 +7,8 @@ ifeq ($(OS),Windows_NT)
 else
   NVIM_PRG ?= ../../../build/bin/nvim
 endif
-ROOT := ../../..
+# ROOT := ../../..
+ROOT := $(abspath ../../..)
 
 export SHELL := sh
 export NVIM_PRG := $(NVIM_PRG)
