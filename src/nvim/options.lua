@@ -1717,14 +1717,12 @@ local options = {
         	    with "menu" or "menuone".  Overrides "preview".
 
            preinsert
-        	    Inserts the text of the first completion candidate beyond
-        	    the current leader, highlighted with |hl-PreInsert|.
-        	    The cursor does not move.
-        	    Requires "fuzzy" to be unset, and either "menuone" in
-        	    'completeopt' or 'autocomplete' enabled.  When
-        	    'autocomplete' is enabled, this does not work if
-        	    'ignorecase' is set without 'infercase'.
-        	    See also |preinserted()|.
+        	    Shows the text of the first completion candidate beyond
+        	    the current leader as virtual text, highlighted with
+        	    |hl-PreInsert|.  The cursor does not move and the buffer
+        	    keeps only what was typed.  When 'autocomplete' is
+        	    enabled, this does not work if 'ignorecase' is set
+        	    without 'infercase'.
 
            preselect
         	    When one of |complete-items| has its "preselect" field set

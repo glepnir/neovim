@@ -643,6 +643,10 @@ CompleteDone			After Insert mode completion is done.  Either
 						  stopped by |complete_CTRL-E|.
 						- "discard": completion was
 						  abandoned for other reason.
+						- "replace": the candidates are
+						  being replaced by
+						  |nvim__complete()|; the
+						  completion itself continues.
 
 							*CompleteDonePre*
 CompleteDonePre			After Insert mode completion is done.  Either

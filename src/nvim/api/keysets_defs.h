@@ -433,6 +433,13 @@ typedef struct {
 } Dict(complete_set);
 
 typedef struct {
+  OptionalKeys is_set__complete_;
+  Integer col;
+  Integer id;
+  Array items;
+} Dict(complete);
+
+typedef struct {
   OptionalKeys is_set__xdl_diff_;
   LuaRefOf((Integer start_a, Integer count_a, Integer start_b, Integer count_b),
            *Integer) on_hunk;

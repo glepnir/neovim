@@ -1201,7 +1201,16 @@ describe('completion', function()
       },
     })
     eq(
-      { completed_item = {}, width = 0, height = 2, size = 2, col = 0, row = 4, scrollbar = false },
+      {
+        completed_item = {},
+        width = 0,
+        height = 2,
+        size = 2,
+        col = 0,
+        row = 4,
+        scrollbar = false,
+        complete_leader = 'f',
+      },
       eval('g:event')
     )
     feed('oob')
@@ -1221,7 +1230,16 @@ describe('completion', function()
       },
     })
     eq(
-      { completed_item = {}, width = 0, height = 1, size = 1, col = 0, row = 4, scrollbar = false },
+      {
+        completed_item = {},
+        width = 0,
+        height = 1,
+        size = 1,
+        col = 0,
+        row = 4,
+        scrollbar = false,
+        complete_leader = 'foob',
+      },
       eval('g:event')
     )
     feed('<Esc>')
@@ -1239,7 +1257,16 @@ describe('completion', function()
       {5:-- Keyword completion (^N^P) }{19:Back at original}               |
     ]])
     eq(
-      { completed_item = {}, width = 15, height = 2, size = 2, col = 0, row = 4, scrollbar = false },
+      {
+        completed_item = {},
+        width = 15,
+        height = 2,
+        size = 2,
+        col = 0,
+        row = 4,
+        scrollbar = false,
+        complete_leader = 'f',
+      },
       eval('g:event')
     )
     feed('<C-N>')
@@ -1971,5 +1998,183 @@ describe('completion', function()
     eq(1, items[2].preselect)
     eq('(', items[3].commit_chars)
     eq({ nil, nil, nil }, { items[4].equal, items[4].preselect, items[4].commit_chars })
+  end)
+
+  describe('complete() item', function()
+    before_each(function()
+      command('set completeopt=menu,menuone,noinsert')
+    end)
+
+    --- @param what 'items'|'matches'
+    local function words(what)
+      return vim.tbl_map(function(m)
+        return m.word
+      end, fn.complete_info({ what })[what])
+    end
+
+    --- @param items table[]
+    local function offer(items)
+      exec_lua(function()
+        _G.items = items
+        vim.keymap.set('i', '<F5>', function()
+          vim.fn.complete(vim.fn.col('.'), _G.items)
+        end)
+      end)
+    end
+
+    it('is filtered by "filter_text" rather than by what it inserts', function()
+      offer({
+        { word = 'os.path.join', filter_text = 'join' },
+        { word = 'os.path.split', filter_text = 'split' },
+      })
+      feed('i<F5>jo')
+      eq({ 'os.path.join' }, words('matches'))
+      feed('<C-y>')
+      eq('os.path.join', api.nvim_get_current_line())
+    end)
+
+    it('replaces from "startcol", which may be in front of the word', function()
+      -- The line is "foo-", so the "-" these replace is at column 4.
+      offer({
+        { word = 'BAR', startcol = 4, filter_text = '-bar' },
+        { word = 'BAZ', startcol = 4, filter_text = '-baz' },
+        -- No "filter_text", so it falls back to "word": "Q" is not the "-"
+        -- this one says it replaces, and it is dropped.
+        { word = 'QUX', startcol = 4 },
+      })
+      feed('ifoo-<F5>')
+      eq({ 'BAR', 'BAZ' }, words('items'))
+      feed('ba')
+      eq({ 'BAR', 'BAZ' }, words('matches'))
+      feed('r<C-y>')
+      eq('fooBAR', api.nvim_get_current_line())
+    end)
+
+    it('replaces from a "startcol" past the completion column', function()
+      -- The line is "obj.fie", so the completion starts at column 5 and this
+      -- item at 7: it leaves the "fi" alone and replaces from the "e".
+      command('set completeopt=menu,menuone')
+      offer({ { word = 'eld2', startcol = 7, filter_text = 'eld2' } })
+      feed('iobj.fie<F5>')
+      eq('obj.field2', api.nvim_get_current_line())
+    end)
+
+    it('repeats a "startcol" item with "."', function()
+      command('set completeopt=menu,menuone')
+      offer({ { word = 'BAR', startcol = 4, filter_text = '-bar' } })
+      -- Two lines holding the same text: "." repeats the completion on the
+      -- second, with no change of its own in between.
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'foo-', 'foo-' })
+      feed('A<F5><C-y><Esc>')
+      eq('fooBAR', api.nvim_get_current_line())
+      feed('j$.')
+      eq({ 'fooBAR', 'fooBAR' }, api.nvim_buf_get_lines(0, 0, -1, true))
+    end)
+
+    it('takes a "startcol" on a multibyte boundary and drops one inside', function()
+      command('set completeopt=menu,menuone')
+      -- Each character in the line is three bytes, so column 4 is the second
+      -- one and column 2 is inside the first.
+      offer({
+        -- Covers the second character, which starts at column 4.
+        { word = 'X', startcol = 4, filter_text = '\229\165\189' },
+        -- Column 2 is inside the first character, so this one is dropped.
+        { word = 'Y', startcol = 2, filter_text = '\228\189\160' },
+      })
+      feed('i\228\189\160\229\165\189<F5>')
+      eq({ 'X' }, words('items'))
+    end)
+
+    it('ignores "startcol" while \'completeopt\' includes "longest"', function()
+      -- 'longest' writes into the line as matches are added, so a column
+      -- measured against it beforehand no longer points where it did.
+      command('set completeopt=menu,menuone,longest')
+      offer({ { word = 'BAR', startcol = 4, filter_text = '-bar' } })
+      feed('ifoo-<F5>')
+      eq(false, fn.complete_info({ 'items' }).items[1].startcol ~= nil)
+
+      -- Without "longest" the item reports the column it asked for.
+      feed('<C-e><Esc>')
+      command('set completeopt=menu,menuone')
+      api.nvim_buf_set_lines(0, 0, -1, true, { '' })
+      feed('ifoo-<F5>')
+      eq(4, fn.complete_info({ 'items' }).items[1].startcol)
+    end)
+
+    it('scores a "startcol" item by its "filter_text" with "fuzzy"', function()
+      command('set completeopt=menu,menuone,noinsert,fuzzy')
+      offer({
+        { word = 'BAR', startcol = 4, filter_text = '-bar' },
+        { word = 'BAZ', startcol = 4, filter_text = '-baz' },
+      })
+      feed('ifoo-<F5>br')
+      eq({ 'BAR' }, words('matches'))
+    end)
+
+    it('applies a "startcol" range to a "word" spanning lines', function()
+      command('set completeopt=menu,menuone')
+      offer({ { word = 'A\nB', startcol = 4, filter_text = '-ab' } })
+      feed('ifoo-<F5>')
+      -- Browsed as its "filter_text", which is one line.
+      eq({ 'foo-ab' }, api.nvim_buf_get_lines(0, 0, -1, true))
+      feed('<C-y>')
+      eq({ 'fooA', 'B' }, api.nvim_buf_get_lines(0, 0, -1, true))
+    end)
+
+    it('keeps the first of two items with the same "word"', function()
+      command('set completeopt=menu,menuone')
+      -- The second is a duplicate, so it is not added and its column is not
+      -- put on the one already there.
+      offer({
+        { word = 'BAR', startcol = 4, filter_text = '-bar' },
+        { word = 'BAR' },
+      })
+      feed('ifoo-<F5>')
+      eq(1, #fn.complete_info({ 'items' }).items)
+      eq(4, fn.complete_info({ 'items' }).items[1].startcol)
+    end)
+
+    it('reports both keys on v:completed_item', function()
+      command('set completeopt=menu,menuone')
+      offer({ { word = 'BAR', startcol = 4, filter_text = '-bar' } })
+      exec_lua(function()
+        vim.api.nvim_create_autocmd('CompleteDone', {
+          once = true,
+          callback = function()
+            _G.item = vim.v.completed_item
+          end,
+        })
+      end)
+      feed('ifoo-<F5><C-y>')
+      eq({ 4, '-bar' }, exec_lua('return { _G.item.startcol, _G.item.filter_text }'))
+    end)
+
+    it('applies a "startcol" range unless the completion is cancelled', function()
+      command('set completeopt=menu,menuone')
+      offer({ { word = 'BAR', startcol = 4, filter_text = '-bar' } })
+
+      -- Browsed as its "filter_text", with the "-" still there.
+      feed('ifoo-<F5>')
+      eq('foo-bar', api.nvim_get_current_line())
+
+      -- <Esc> keeps the match, as it does for any other item, so the range
+      -- goes in and CompleteDone reports it.
+      exec_lua(function()
+        vim.api.nvim_create_autocmd('CompleteDone', {
+          once = true,
+          callback = function()
+            _G.done = { vim.v.event.reason, vim.v.event.complete_word }
+          end,
+        })
+      end)
+      feed('<Esc>')
+      eq('fooBAR', api.nvim_get_current_line())
+      eq({ 'accept', 'BAR' }, exec_lua('return _G.done'))
+
+      -- CTRL-E puts the typed text back.
+      api.nvim_buf_set_lines(0, 0, -1, true, { '' })
+      feed('ifoo-<F5><C-e>')
+      eq('foo-', api.nvim_get_current_line())
+    end)
   end)
 end)

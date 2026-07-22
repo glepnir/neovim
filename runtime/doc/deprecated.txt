@@ -52,6 +52,11 @@ LSP
 VIMSCRIPT
 • ctxget(), ctxpop(), ctxpush(), ctxset(), ctxsize(). Use
   |nvim_get_context()| and |nvim_load_context()| instead.
+                                                                *preinserted()*
+• preinserted(), |complete_info()| "preinserted_text". The 'completeopt'
+  "preinsert" preview is virtual text: read the extmark in the
+  "nvim.completion.preinsert" namespace instead.  Both report only what
+  "longest" inserts, which is not what the name suggests.
 
 ------------------------------------------------------------------------------
 DEPRECATED IN 0.12					*deprecated-0.12*
