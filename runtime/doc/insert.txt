@@ -1259,6 +1259,20 @@ items:
 			usual.  Takes precedence over extending the leader.
 			Only while the popup menu is displayed.  Control
 			characters (below 0x20) are ignored.
+	startcol	Column where the text this item replaces starts
+			(the first column is 1).  May be before the
+			`col` given to |complete()|, in which case the
+			item replaces that text instead of the text the
+			session started at; an LSP text edit whose range
+			reaches back over a "." is the usual reason.
+			Ignored, and the item treated like any other,
+			when it is not a byte index into the line, not
+			on a character boundary, after `col`, or when
+			"filter_text" does not begin with the text it
+			would cover.
+	filter_text	Text this item is filtered by.  Defaults to
+			"word".  Giving both lets an item be found by
+			one text and insert another.
 
 All of these except "icase", "equal", "dup" and "empty" must be a string.  If
 an item does not meet these requirements then an error message is given and

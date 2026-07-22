@@ -1,6 +1,5 @@
 local t = require('test.testutil')
 local describe, it, before_each, finally = t.describe, t.it, t.before_each, t.finally
-local pcall_err = t.pcall_err
 local n = require('test.functional.testnvim')()
 local Screen = require('test.functional.ui.screen')
 
@@ -1178,7 +1177,7 @@ describe('completion', function()
       },
     })
     eq(
-      { completed_item = {}, width = 0, height = 2, size = 2, col = 0, row = 4, scrollbar = false },
+      { completed_item = {}, complete_leader = 'f', width = 0, height = 2, size = 2, col = 0, row = 4, scrollbar = false },
       eval('g:event')
     )
     feed('oob')
@@ -1198,7 +1197,7 @@ describe('completion', function()
       },
     })
     eq(
-      { completed_item = {}, width = 0, height = 1, size = 1, col = 0, row = 4, scrollbar = false },
+      { completed_item = {}, complete_leader = 'foob', width = 0, height = 1, size = 1, col = 0, row = 4, scrollbar = false },
       eval('g:event')
     )
     feed('<Esc>')
@@ -1216,7 +1215,7 @@ describe('completion', function()
       {5:-- Keyword completion (^N^P) }{19:Back at original}               |
     ]])
     eq(
-      { completed_item = {}, width = 15, height = 2, size = 2, col = 0, row = 4, scrollbar = false },
+      { completed_item = {}, complete_leader = 'f', width = 15, height = 2, size = 2, col = 0, row = 4, scrollbar = false },
       eval('g:event')
     )
     feed('<C-N>')

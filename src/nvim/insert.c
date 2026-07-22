@@ -568,6 +568,16 @@ static int insert_execute(VimState *state, int key)
     ins_compl_clear_autocomplete_delay();
   }
 
+  // A session fed by the API keeps running with an empty list, so <BS> reaches
+  // ins_compl_bs() without a match to show; the block below needs one.
+  if (ins_compl_active() && ins_compl_replaceable_session()
+      && !ins_compl_has_shown_match()
+      && (s->c == K_BS || s->c == Ctrl_H)
+      && curwin->w_cursor.col > ins_compl_col()
+      && (s->c = ins_compl_bs()) == NUL) {
+    return 1;  // continue
+  }
+
   // Special handling of keys while the popup menu is visible or wanted
   // and the cursor is still in the completed word.  Only when there is
   // a match, skip this when no matches were found.
@@ -580,8 +590,10 @@ static int insert_execute(VimState *state, int key)
       return 1;  // continue
     }
 
-    // When no match was selected or it was edited.
-    if (!ins_compl_used_match()) {
+    // When no match was selected or it was edited.  A replaceable session gets
+    // here with a match inserted too: it takes the match back out and extends
+    // the leader instead of ending, so the caller can install new matches.
+    if (!ins_compl_used_match() || ins_compl_replaceable_session()) {
       // CTRL-L: Add one character from the current match to
       // "compl_leader".  Except when at the original match and
       // there is nothing to add, CTRL-L works like CTRL-P then.
@@ -618,14 +630,18 @@ static int insert_execute(VimState *state, int key)
           && stop_arrow() == OK) {
         ins_compl_delete(false);
         if (ins_compl_preinsert_longest() && !ins_compl_is_match_selected()) {
-          ins_compl_insert(false, true);
+          ins_compl_insert(false, true, false);
           ins_compl_init_get_longest();
           return 1;  // continue
         } else {
-          ins_compl_insert(false, false);
+          // Accept here, or ins_compl_stop() writes the match a second time.
+          ins_compl_insert(false, false, true);
         }
       } else if (ascii_iswhite_nl_or_nul(s->c) && ins_compl_preinsert_effect()) {
-        // Delete preinserted text when typing special chars
+        // Delete preinserted text when typing special chars.  The match is gone
+        // from the line, so ins_compl_stop() must not apply its edit: the
+        // preinsert branch there sees compl_ins_end_col == cursor by now and
+        // will not clear the flag itself.
         ins_compl_delete(false);
       }
     }
