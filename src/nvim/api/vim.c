@@ -87,6 +87,7 @@
 #include "nvim/terminal.h"
 #include "nvim/types_defs.h"
 #include "nvim/ui.h"
+#include "nvim/undo.h"
 #include "nvim/vim_defs.h"
 #include "nvim/window.h"
 
@@ -2446,6 +2447,85 @@ DictOf(Float) nvim__complete_set(Integer index, Dict(complete_set) *opts, Arena 
     }
   }
   return rv;
+}
+
+/// Starts a completion session, or replaces or ends one started here.
+///
+/// Like |complete()|, but the candidates can be replaced while the user types,
+/// so an asynchronous source can show what it has and follow up.
+///
+/// @param opts  Optional parameters.
+///              - col: (integer) 1-based byte column the candidates start at.
+///                Required when starting.
+///              - id: (integer) Session to replace or end, as returned here.
+///              - items: (array) Candidates, see |complete-items|.  Omitted
+///                with an `id`, ends that session.
+/// @return Session id, or -1 when not in Insert mode, under |textlock|, the
+///         session is gone, or "col" is not in the cursor line.
+Integer nvim__complete(Dict(complete) *opts, Error *err)
+  FUNC_API_SINCE(15)
+{
+  int64_t id = HAS_KEY(opts, complete, id) ? opts->id : 0;
+  VALIDATE_INT(id >= 0, "id", id, {
+    return -1;
+  });
+  VALIDATE_CON(id == 0 || !HAS_KEY(opts, complete, col), "col", "id", {
+    return -1;
+  });
+  VALIDATE(!HAS_KEY(opts, complete, items) || opts->items.size > 0, "%s",
+           "'items' must not be empty", {
+    return -1;
+  });
+  if (!HAS_KEY(opts, complete, items)) {
+    VALIDATE_R(id > 0, "items", {
+      return -1;
+    });
+  } else if (id == 0) {
+    VALIDATE_R(HAS_KEY(opts, complete, col), "col", {
+      return -1;
+    });
+    VALIDATE_INT(opts->col >= 1 && opts->col <= INT_MAX, "col", opts->col, {
+      return -1;
+    });
+  }
+
+  // Answered rather than raised: the caller is usually a response that raced
+  // the user out of Insert mode or into a CompleteChanged handler.
+  if ((State & MODE_INSERT) == 0 || textlock != 0) {
+    return -1;
+  }
+
+  Integer ret = -1;
+  if (!HAS_KEY(opts, complete, items)) {
+    TRY_WRAP(err, {  // ins_compl_prep() fires CompleteDone
+      ret = ins_compl_stop_session(id);
+    });
+  } else {
+    typval_T items_tv;
+    object_to_vim(ARRAY_OBJ(opts->items), &items_tv, err);
+    if (ERROR_SET(err)) {
+      tv_clear(&items_tv);
+      return -1;
+    }
+    // Outside TRY_WRAP, which would turn the message it prints into an error.
+    if (!undo_allowed(curbuf)) {
+      tv_clear(&items_tv);
+      return -1;
+    }
+    TRY_WRAP(err, {
+      ret = id == 0
+            ? ins_compl_start_session((colnr_T)opts->col, items_tv.vval.v_list)
+            : ins_compl_replace_list(items_tv.vval.v_list, id);
+    });
+    tv_clear(&items_tv);
+  }
+  // Raised by an autocommand, not by the arguments: reported like one raised
+  // while typing, so that a started session's id still reaches the caller.
+  if (ERROR_SET(err)) {
+    emsg(err->msg);
+    api_clear_error(err);
+  }
+  return ret;
 }
 
 static void redraw_status(win_T *wp, Dict(redraw) *opts, bool *flush)

@@ -372,9 +372,9 @@ RCS['textDocument/completion'] = function(_, result, _)
   local line = assert(api.nvim_buf_get_lines(0, row - 1, row, false)[1])
   local line_to_cursor = line:sub(col + 1)
   local textMatch = vim.fn.match(line_to_cursor, '\\k*$')
-  local prefix = line_to_cursor:sub(textMatch + 1)
 
-  local matches = completion._lsp_to_complete_items(result, prefix)
+  local matches =
+    completion._lsp_to_complete_items(result, textMatch, #line_to_cursor, nil, line_to_cursor)
   vim.fn.complete(textMatch + 1, matches)
 end
 

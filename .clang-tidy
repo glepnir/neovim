@@ -68,6 +68,8 @@ Checks: >
   -readability-function-cognitive-complexity,
   -readability-identifier-length,
   -readability-magic-numbers,
+  -readability-trailing-comma,
+  -readability-redundant-parentheses,
   -readability-math-missing-parentheses,
   -readability-redundant-declaration, Conflicts with our header generation scripts,
   -readability-suspicious-call-argument,
