@@ -1754,6 +1754,42 @@ nvim__cmdwin_set({type}, {buf})                           *nvim__cmdwin_set()*
       • {type}  (`string`) ':', '/', '?' (first char only); empty to clear.
       • {buf}   (`integer`) cmdwin buffer id, or 0 to clear.
 
+nvim__complete({opts})                                      *nvim__complete()*
+    WARNING: This feature is experimental/unstable.
+
+    Starts, replaces or stops a completion session, as |ins-completion| would.
+
+    Unlike |complete()| a session started here keeps running while the leader
+    is typed: the caller answers each new one by replacing the candidates, so
+    an asynchronous source can hand over what it has and follow up.
+
+    Note: ~
+      • Replacing the candidates of a session answers -1 when the session is
+        gone or Insert mode has ended, since the caller is a batch that raced
+        the user and has nothing to report; so does a "col" past the cursor or
+        off a character boundary. A buffer that cannot be changed answers -1
+        either way, saying why through a message, and a handler raising during
+        the call is reported the same way once the session is up. Starting one
+        raises instead, |textlock| included: that is the caller asking for a
+        session rather than a batch that raced the user.
+
+    Attributes: ~
+        Since: 0.13.0
+
+    Parameters: ~
+      • {opts}  (`vim.api.keyset.complete?`) Optional parameters.
+                • col: (integer) 1-based byte column the candidates start at.
+                  Required to start a session.
+                • id: (integer) Session to replace or stop, as returned here.
+                • items: (array) Candidates, see |complete-items|. An empty
+                  list, or omitting them with an `id`, ends that session: one
+                  running on nothing still takes the keys |i_CTRL-N| and
+                  |i_CTRL-E| would go to.
+
+    Return: ~
+        (`integer`) The session's id -- the one given, when it was stopped --
+        or -1.
+
 nvim__complete_set({index}, {opts})                     *nvim__complete_set()*
     WARNING: This feature is experimental/unstable.
 

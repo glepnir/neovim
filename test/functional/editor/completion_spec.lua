@@ -1201,7 +1201,16 @@ describe('completion', function()
       },
     })
     eq(
-      { completed_item = {}, width = 0, height = 2, size = 2, col = 0, row = 4, scrollbar = false },
+      {
+        completed_item = {},
+        width = 0,
+        height = 2,
+        size = 2,
+        col = 0,
+        row = 4,
+        scrollbar = false,
+        complete_leader = 'f',
+      },
       eval('g:event')
     )
     feed('oob')
@@ -1221,7 +1230,16 @@ describe('completion', function()
       },
     })
     eq(
-      { completed_item = {}, width = 0, height = 1, size = 1, col = 0, row = 4, scrollbar = false },
+      {
+        completed_item = {},
+        width = 0,
+        height = 1,
+        size = 1,
+        col = 0,
+        row = 4,
+        scrollbar = false,
+        complete_leader = 'foob',
+      },
       eval('g:event')
     )
     feed('<Esc>')
@@ -1239,7 +1257,16 @@ describe('completion', function()
       {5:-- Keyword completion (^N^P) }{19:Back at original}               |
     ]])
     eq(
-      { completed_item = {}, width = 15, height = 2, size = 2, col = 0, row = 4, scrollbar = false },
+      {
+        completed_item = {},
+        width = 15,
+        height = 2,
+        size = 2,
+        col = 0,
+        row = 4,
+        scrollbar = false,
+        complete_leader = 'f',
+      },
       eval('g:event')
     )
     feed('<C-N>')
@@ -1808,6 +1835,30 @@ describe('completion', function()
     ]])
   end)
 
+  it("draws the 'preinsert' preview in the completing window only", function()
+    -- An extmark belongs to the buffer, so a second window on it would draw the
+    -- preview too; preinsert.lua scopes the namespace to the one completing.
+    source([[
+      call setline(1, ['hello', ''])
+      set completeopt=menu,menuone,preinsert
+      split
+    ]])
+    feed('Gih<C-n>')
+    -- The top window is the one completing: "h" there is followed by the inline
+    -- {102:ello}, while the same line in the bottom one carries only the "h".
+    -- Dropping nvim__ns_set() from preinsert.lua puts "ello" in both.
+    screen:expect([[
+      hello                                                       |
+      h{102:^ello}                                                       |
+      {12:hello          }{1:                                             }|
+      {3:[No Name] [+]                                               }|
+      hello                                                       |
+      h                                                           |
+      {2:[No Name] [+]                                               }|
+      {5:-- Keyword completion (^N^P) The only match}                 |
+    ]])
+  end)
+
   -- oldtest: Test_autocompletedelay_longest_preinsert()
   it("'autocompletedelay' with 'completeopt' longest/preinsert", function()
     source([[
@@ -1971,5 +2022,125 @@ describe('completion', function()
     eq(1, items[2].preselect)
     eq('(', items[3].commit_chars)
     eq({ nil, nil, nil }, { items[4].equal, items[4].preselect, items[4].commit_chars })
+  end)
+end)
+
+describe('vim._core.completion', function()
+  before_each(clear)
+
+  it('registers a completionProvider that matches every buffer', function()
+    -- No documentSelector: it matches on a glob of the file name, which an
+    -- unnamed buffer has none of.
+    eq(
+      { 1, true },
+      exec_lua(function()
+        local completion = require('vim._core.completion')
+        completion.enable(true, 0, { sources = { completion.source.files } })
+        -- By id: enable() starts the server, and get_clients() filters on a
+        -- name the client only carries once it is registered.
+        local client = assert(
+          vim.lsp.get_client_by_id(completion.get_sources(0)[1].client_id),
+          'the completion server did not start'
+        )
+        return {
+          #(client:_get_registrations('completionProvider', 0) or {}),
+          client:supports_method('textDocument/completion', 0),
+        }
+      end)
+    )
+  end)
+
+  it('offers the characters of every buffer it was enabled for', function()
+    eq(
+      { '/' },
+      exec_lua(function()
+        local completion = require('vim._core.completion')
+        local other = vim.api.nvim_create_buf(true, false)
+        completion.enable(true, 0, { sources = { completion.source.keyword } })
+        completion.enable(true, other, { sources = { completion.source.files } })
+        local client = assert(
+          vim.lsp.get_client_by_id(completion.get_sources(0)[1].client_id),
+          'the completion server did not start'
+        )
+        local regs = client:_get_registrations('completionProvider', 0)
+        return regs[1].registerOptions.triggerCharacters
+      end)
+    )
+  end)
+
+  it('answers a trigger character with the buffer\'s own sources', function()
+    -- The two builtin gates are complementary, so a path goes to one of them
+    -- and a word to the other; a buffer with only "keyword" answers neither.
+    eq(
+      { isIncomplete = false, items = {} },
+      exec_lua(function()
+        local completion = require('vim._core.completion')
+        completion.enable(true, 0, { sources = { completion.source.keyword } })
+        -- A directory the test makes, not one the cwd happens to have.
+        local dir = vim.fs.joinpath(vim.fn.tempname(), 'sub')
+        vim.fn.mkdir(dir, 'p')
+        vim.api.nvim_set_current_dir(vim.fs.dirname(dir))
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'sub/' })
+        vim.api.nvim_win_set_cursor(0, { 1, 4 })
+        return vim.async
+          .run(function()
+            return completion._do_complete({
+              textDocument = { uri = vim.uri_from_bufnr(0) },
+              position = { line = 0, character = 4 },
+              context = { triggerKind = 2, triggerCharacter = '/' },
+            })
+          end)
+          :wait(1000)
+      end)
+    )
+  end)
+
+  it('requires sources', function()
+    eq(
+      false,
+      exec_lua(function()
+        return pcall(require('vim._core.completion').enable, true, 0, {})
+      end)
+    )
+  end)
+
+  it('forgets a buffer that is wiped out', function()
+    eq(
+      0,
+      exec_lua(function()
+        local completion = require('vim._core.completion')
+        local buf = vim.api.nvim_create_buf(true, false)
+        completion.enable(true, buf, { sources = { completion.source.keyword } })
+        vim.api.nvim_buf_delete(buf, { force = true })
+        return #completion.get_sources(buf)
+      end)
+    )
+  end)
+
+  it('replaces the sources a previous call gave', function()
+    eq(
+      { 'files' },
+      exec_lua(function()
+        local completion = require('vim._core.completion')
+        completion.enable(true, 0, { sources = { completion.source.keyword } })
+        completion.enable(true, 0, { sources = { completion.source.files } })
+        return vim.tbl_map(function(s)
+          return s.name
+        end, completion.get_sources(0))
+      end)
+    )
+  end)
+
+  it('keeps only the last source of a name', function()
+    eq(
+      1,
+      exec_lua(function()
+        local completion = require('vim._core.completion')
+        completion.enable(true, 0, {
+          sources = { completion.source.keyword, completion.source.keyword },
+        })
+        return #completion.get_sources(0)
+      end)
+    )
   end)
 end)

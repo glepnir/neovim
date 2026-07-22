@@ -1167,12 +1167,15 @@ vim.go.cia = vim.go.completeitemalign
 ---
 --- 	    When 'autocomplete' is active and no completion item is
 --- 	    selected, the longest common prefix of the matches is
---- 	    inserted after the cursor.  The prefix is taken either
---- 	    from all displayed items or only from items in the current
---- 	    buffer.  The inserted text is highlighted with
---- 	    `hl-PreInsert`, and the cursor position does not change
---- 	    (similar to `"preinsert"`).  Press CTRL-Y to accept.
---- 	    See also `preinserted()`.
+--- 	    inserted after the cursor.  Not for candidates coming from
+--- 	    `nvim__complete()`: there only the "nothing selected" half
+--- 	    of this applies, since a shortened leader would no longer
+--- 	    describe what the caller filtered by.  The prefix is taken
+--- 	    either from all displayed items or only from items in the
+--- 	    current buffer.  The inserted text is highlighted with
+--- 	    `hl-PreInsert`, and the cursor position does not change.
+--- 	    Unlike `"preinsert"`, the text is really in the buffer.
+--- 	    Press CTRL-Y to accept.  See also `preinserted()`.
 ---
 ---    menu	    Use a popup menu to show the possible completions.  The
 --- 	    menu is only shown when there is more than one match.
@@ -1206,14 +1209,15 @@ vim.go.cia = vim.go.completeitemalign
 --- 	    with "menu" or "menuone".  Overrides "preview".
 ---
 ---    preinsert
---- 	    Inserts the text of the first completion candidate beyond
---- 	    the current leader, highlighted with `hl-PreInsert`.
---- 	    The cursor does not move.
---- 	    Requires "fuzzy" to be unset, and either "menuone" in
---- 	    'completeopt' or 'autocomplete' enabled.  When
---- 	    'autocomplete' is enabled, this does not work if
---- 	    'ignorecase' is set without 'infercase'.
---- 	    See also `preinserted()`.
+--- 	    Shows the text of the selected completion candidate beyond
+--- 	    the current leader as virtual text, highlighted with
+--- 	    `hl-PreInsert`.  The cursor does not move, and the buffer
+--- 	    holds only what was typed until the match is accepted.
+--- 	    Requires "menuone" in 'completeopt'.  When 'autocomplete'
+--- 	    is enabled, this does not work if 'ignorecase' is set
+--- 	    without 'infercase'.  With "fuzzy", a candidate that does not
+--- 	    continue the leader has nothing to show and is not
+--- 	    previewed.
 ---
 ---    preselect
 --- 	    When one of `complete-items` has its "preselect" field set
