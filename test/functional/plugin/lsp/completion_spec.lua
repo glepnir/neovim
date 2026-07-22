@@ -28,28 +28,26 @@ end
 ---@param line string line contents. Mark cursor position with `|`
 ---@param candidates lsp.CompletionList|lsp.CompletionItem[]
 ---@param lnum? integer 0-based, defaults to 0
----@return {items: table[], server_start_boundary: integer?}
-local function complete(line, candidates, lnum, server_boundary)
+---@return {items: table[]}
+local function complete(line, candidates, lnum)
   lnum = lnum or 0
   -- nvim_win_get_cursor returns 0 based column, line:find returns 1 based
   local cursor_col = line:find('|') - 1
   line = line:gsub('|', '')
   return exec_lua(function(result)
     local line_to_cursor = line:sub(1, cursor_col)
-    local client_start_boundary = vim.fn.match(line_to_cursor, '\\k*$')
-    local items, new_server_boundary = require('vim.lsp.completion')._convert_results(
+    local compl_col = vim.fn.match(line_to_cursor, '\\k*$')
+    local items = require('vim.lsp.completion')._convert_results(
       line,
       lnum,
       cursor_col,
       1,
-      client_start_boundary,
-      server_boundary,
+      compl_col,
       result,
       'utf-16'
     )
     return {
       items = items,
-      server_start_boundary = new_server_boundary,
     }
   end, candidates)
 end
@@ -65,6 +63,26 @@ local function wait_for_pum(visible)
         return vim.fn.pumvisible()
       end)
     )
+  end)
+end
+
+--- The 'preinsert' preview, which is virtual text rather than buffer content.
+---
+--- Errors when the module that draws it never ran, so that a missing preview
+--- and a missing namespace do not look the same.
+---@return string? nil when nothing is previewed
+local function preview_text()
+  return exec_lua(function()
+    local ns = assert(
+      vim.api.nvim_get_namespaces()['nvim.completion.preinsert'],
+      "the 'preinsert' preview module has not run"
+    )
+    local marks = vim.api.nvim_buf_get_extmarks(0, ns, 0, -1, { details = true })
+    if #marks == 0 then
+      return nil
+    end
+    assert(#marks == 1, 'more than one preview')
+    return marks[1][4].virt_text[1][1]
   end)
 end
 
@@ -232,7 +250,7 @@ describe('vim.lsp.completion: item conversion', function()
     eq(expected, got)
   end
 
-  it('uses filterText as word if label/newText would not match', function()
+  it('filters by filterText while inserting the edit text', function()
     local items = {
       {
         filterText = '<module',
@@ -272,11 +290,11 @@ describe('vim.lsp.completion: item conversion', function()
       },
     }
     assert_completion_matches('<mo', items, {
-      { abbr = 'module', word = '<module' },
+      { abbr = 'module', word = 'module' },
     })
     assert_completion_matches('a', items, {
-      { abbr = '•std::atto', word = 'atto' },
-      { abbr = '•std::adopt_lock_t', word = 'adopt_lock_t' },
+      { abbr = '•std::atto', word = 'std::atto' },
+      { abbr = '•std::adopt_lock_t', word = 'std::adopt_lock_t' },
     })
     assert_completion_matches('', items, {
       { abbr = 'module', word = 'module' },
@@ -470,7 +488,7 @@ describe('vim.lsp.completion: item conversion', function()
       { label = ' foo', insertText = '->foo', sortText = '1' },
       { label = ' bar', insertText = '->bar', filterText = 'bar', sortText = '2' },
     }
-    local result = complete('wp.|', completion_list, 0, 2)
+    local result = complete('wp.|', completion_list, 0)
     eq({
       { abbr = ' foo', word = '->foo' },
       { abbr = ' bar', word = '->bar' },
@@ -621,6 +639,7 @@ describe('vim.lsp.completion: item conversion', function()
         empty = 1,
         icase = 1,
         info = '',
+        filter_text = 'this_thread',
         kind = 'Module',
         menu = '',
         abbr_hlgroup = '',
@@ -628,7 +647,6 @@ describe('vim.lsp.completion: item conversion', function()
       },
     }
     local result = complete('  std::this|', completion_list)
-    eq(7, result.server_start_boundary)
     for _, item in ipairs(result.items) do
       item.user_data = nil
     end
@@ -677,6 +695,7 @@ describe('vim.lsp.completion: item conversion', function()
       abbr = ' this_thread',
       dup = 1,
       empty = 1,
+      filter_text = 'this_thread',
       icase = 1,
       info = '',
       kind = 'Module',
@@ -869,7 +888,7 @@ end)
 
 --- @param name string
 --- @param completion_result vim.lsp.CompletionResult
---- @param opts? {trigger_chars?: string[], resolve_result?: lsp.CompletionItem|lsp.CompletionItem[], delay?: integer, cmp?: string}
+--- @param opts? {trigger_chars?: string[], resolve_result?: lsp.CompletionItem|lsp.CompletionItem[], delay?: integer, cmp?: string, insert_mode?: string}
 --- @return integer
 local function create_server(name, completion_result, opts)
   opts = opts or {}
@@ -919,6 +938,7 @@ local function create_server(name, completion_result, opts)
             return { abbr = item.label:gsub('%b()', '') }
           end,
           cmp = cmp_fn,
+          insert_mode = opts.insert_mode,
         })
       end,
     })
@@ -932,9 +952,14 @@ describe('vim.lsp.completion: protocol', function()
     exec_lua(function()
       _G.capture = {}
       --- @diagnostic disable-next-line:duplicate-set-field
-      vim.fn.complete = function(col, matches)
-        _G.capture.col = col
-        _G.capture.matches = matches
+      vim.api.nvim__complete = function(opts)
+        _G.capture.col = opts.col or _G.capture.col
+        if opts.items then
+          _G.capture.matches = opts.items
+        else
+          _G.capture.stopped = opts.id  -- no items: the session is being ended
+        end
+        return opts.id or 1
       end
     end)
   end)
@@ -958,6 +983,57 @@ describe('vim.lsp.completion: protocol', function()
     end)
   end
 
+  --- Collects vim.notify_once into `_G.warnings`. Also keeps a warning from
+  --- raising a hit-enter prompt, which would swallow a later feed().
+  local function capture_warnings()
+    exec_lua(function()
+      _G.warnings = {}
+      --- @diagnostic disable-next-line:duplicate-set-field
+      vim.notify_once = function(msg)
+        _G.warnings[#_G.warnings + 1] = msg
+        return true
+      end
+    end)
+  end
+
+  --- Starts an autotrigger server ('h' triggers) that answers the Nth request
+  --- with the Nth entry of `script`; the last entry repeats. The request count
+  --- is in `_G.n_requests`.
+  --- @param script { err?: table, result?: table }[]
+  local function start_scripted_server(script)
+    return exec_lua(function()
+      _G.n_requests = 0
+      local server = _G._create_server({
+        capabilities = { completionProvider = { triggerCharacters = { 'h' } } },
+        handlers = {
+          ['textDocument/completion'] = function(_, _, callback)
+            _G.n_requests = _G.n_requests + 1
+            local step = script[math.min(_G.n_requests, #script)]
+            callback(step.err, step.result)
+          end,
+        },
+      })
+      vim.api.nvim_win_set_buf(0, vim.api.nvim_get_current_buf())
+      return vim.lsp.start({
+        name = 'scripted',
+        cmd = server.cmd,
+        on_attach = function(client, bufnr0)
+          vim.lsp.completion.enable(true, client.id, bufnr0, { autotrigger = true })
+        end,
+      })
+    end)
+  end
+
+  --- Lets any pending debounce timer and re-request run, so that "nothing
+  --- more happened" can be asserted.
+  local function settle()
+    exec_lua(function()
+      vim.wait(200, function()
+        return false
+      end)
+    end)
+  end
+
   it('fetches completions and shows them using complete on trigger', function()
     create_server('dummy', {
       isIncomplete = false,
@@ -977,6 +1053,7 @@ describe('vim.lsp.completion: protocol', function()
           abbr = 'hello',
           dup = 1,
           empty = 1,
+          filter_text = 'hello',
           icase = 1,
           info = '',
           kind = 'Unknown',
@@ -998,6 +1075,7 @@ describe('vim.lsp.completion: protocol', function()
           abbr = 'hercules',
           dup = 1,
           empty = 1,
+          filter_text = 'hercules',
           icase = 1,
           info = '',
           kind = 'Unknown',
@@ -1019,6 +1097,7 @@ describe('vim.lsp.completion: protocol', function()
           abbr = 'hero',
           dup = 1,
           empty = 1,
+          filter_text = 'hero',
           icase = 1,
           info = '',
           kind = 'Unknown',
@@ -1281,22 +1360,21 @@ describe('vim.lsp.completion: protocol', function()
     end)
   end)
 
-  it('errors on invalid items=null in completion response #39400', function()
-    create_server('dummy', {
-      isIncomplete = false,
-      items = vim.NIL,
-    })
+  it('reports items=null without dropping the other clients #39400', function()
+    capture_warnings()
+    create_server('bad', { isIncomplete = false, items = vim.NIL })
+    create_server('good', { isIncomplete = false, items = { { label = 'hello' } } })
+
     feed('ih')
-    local err = t.pcall_err(function()
-      exec_lua(function()
-        vim.api.nvim_win_set_cursor(0, { 1, 1 })
-        vim.lsp.completion.get()
-        vim.wait(1000, function()
-          return false
-        end)
-      end)
+    trigger_at_pos({ 1, 1 })
+
+    -- Raising here would abort the response loop and silently discard every
+    -- client after the malformed one.
+    assert_matches(function(matches)
+      eq(1, #matches)
+      eq('hello', matches[1].word)
     end)
-    t.matches('items=null', err)
+    t.matches('items=null', exec_lua('return table.concat(_G.warnings, " ")'))
   end)
 
   it('keeps requerying while the completion list is incomplete #40096', function()
@@ -1336,15 +1414,169 @@ describe('vim.lsp.completion: protocol', function()
     end)
     eq({ triggerKind = 3 }, exec_lua('return _G.contexts[2]'))
   end)
+
+  it('drops the list and the incomplete flag on a null result', function()
+    start_scripted_server({
+      { result = { isIncomplete = true, items = { { label = 'hello' } } } },
+      {}, -- null: valid per the spec, and means "nothing here"
+    })
+
+    feed('ih')
+    assert_matches(function(matches)
+      eq('hello', matches[1].word)
+    end)
+
+    exec_lua('_G.capture = {}')
+    feed('e') -- incomplete, so this re-queries and gets null back
+    retry(nil, nil, function()
+      eq(2, exec_lua('return _G.n_requests'))
+    end)
+    -- Ended rather than left running on an empty list, which would take every
+    -- key for candidates that are never coming.
+    retry(nil, nil, function()
+      eq(1, exec_lua('return _G.capture.stopped'))
+    end)
+
+    -- Keeping the flag set here would re-query on every further keystroke.
+    feed('l')
+    settle()
+    eq(2, exec_lua('return _G.n_requests'))
+  end)
+
+  it('drops the list and the incomplete flag on an error response', function()
+    capture_warnings()
+    start_scripted_server({
+      { result = { isIncomplete = true, items = { { label = 'hello' } } } },
+      { err = { code = -32603, message = 'boom' } },
+    })
+
+    feed('ih')
+    assert_matches(function(matches)
+      eq('hello', matches[1].word)
+    end)
+
+    exec_lua('_G.capture = {}')
+    feed('e')
+    retry(nil, nil, function()
+      eq(2, exec_lua('return _G.n_requests'))
+    end)
+    retry(nil, nil, function()
+      eq(1, exec_lua('return _G.capture.stopped'))
+    end)
+
+    feed('l')
+    settle()
+    eq(2, exec_lua('return _G.n_requests'))
+  end)
+
+  it('keeps the cached list when the server answers ContentModified', function()
+    capture_warnings()
+    start_scripted_server({
+      { result = { isIncomplete = true, items = { { label = 'hello' } } } },
+      { err = { code = -32801, message = 'content modified' } },
+    })
+
+    feed('ih')
+    assert_matches(function(matches)
+      eq('hello', matches[1].word)
+    end)
+
+    feed('e')
+    retry(nil, nil, function()
+      eq(2, exec_lua('return _G.n_requests'))
+    end)
+
+    -- -32801/-32800 mean "ignore this answer", not "you have nothing": the
+    -- cached list and the incomplete flag both survive, and nothing is warned.
+    settle()
+    assert_matches(function(matches)
+      eq('hello', matches[1].word)
+    end)
+    eq({}, exec_lua('return _G.warnings'))
+
+    feed('l')
+    retry(nil, nil, function()
+      eq(3, exec_lua('return _G.n_requests'))
+    end)
+  end)
+
+  it('publishes the other clients when one request is not dispatched', function()
+    capture_warnings()
+    local id1 = create_server('dummy1', { isIncomplete = false, items = { { label = 'hello' } } })
+    create_server('dummy2', { isIncomplete = false, items = { { label = 'hallo' } } })
+
+    exec_lua(function()
+      local client = assert(vim.lsp.get_client_by_id(id1))
+      --- @diagnostic disable-next-line:duplicate-set-field
+      client.request = function()
+        return false -- server restarting, buffer detached, ...
+      end
+    end)
+
+    feed('ih')
+    trigger_at_pos({ 1, 1 })
+
+    -- An undeliverable request registers no handler, so under wait-for-all it
+    -- used to withhold every other client's results too.
+    assert_matches(function(matches)
+      eq(1, #matches)
+      eq('hallo', matches[1].word)
+    end)
+  end)
+
+  it('drops a disabled client from an in-progress session', function()
+    -- Both labels have to survive the 'he' prefix filter below, otherwise the
+    -- assertion passes for the wrong reason.
+    local id1 = create_server(
+      'dummy1',
+      { isIncomplete = true, items = { { label = 'hello' } } },
+      { trigger_chars = { 'h' } }
+    )
+    create_server(
+      'dummy2',
+      { isIncomplete = true, items = { { label = 'help' } } },
+      { trigger_chars = { 'h' } }
+    )
+
+    feed('ih')
+    assert_matches(function(matches)
+      eq(2, #matches)
+    end)
+
+    exec_lua(function()
+      vim.lsp.completion.enable(false, id1, vim.api.nvim_get_current_buf())
+    end)
+
+    exec_lua('_G.capture = {}')
+    feed('e') -- dummy2 is still incomplete, so this re-queries and republishes
+    assert_matches(function(matches)
+      eq(1, #matches)
+      eq('help', matches[1].word)
+    end)
+  end)
+
+  it('honours clearing completionProvider on the client', function()
+    local id1 = create_server('dummy1', { isIncomplete = false, items = { { label = 'hello' } } })
+    create_server('dummy2', { isIncomplete = false, items = { { label = 'hallo' } } })
+
+    exec_lua(function()
+      assert(vim.lsp.get_client_by_id(id1)).server_capabilities.completionProvider = nil
+    end)
+
+    feed('ih')
+    trigger_at_pos({ 1, 1 })
+
+    assert_matches(function(matches)
+      eq(1, #matches)
+      eq('hallo', matches[1].word)
+    end)
+  end)
 end)
 
 describe('vim.lsp.completion: integration', function()
   before_each(function()
     clear()
     exec_lua(create_server_definition)
-    exec_lua(function()
-      vim.fn.complete = vim.schedule_wrap(vim.fn.complete)
-    end)
   end)
 
   it('puts cursor at the end of completed word', function()
@@ -1384,6 +1616,96 @@ describe('vim.lsp.completion: integration', function()
       end)
     )
     assert_cleanup_after_detach(client_id)
+  end)
+
+  -- An additionalTextEdit that lands before the completion point moves it, and
+  -- the snippet then has to expand at the moved point, not the recorded one.
+  --- @param new_text string text the edit inserts at (0,0)
+  --- @param expected string[] resulting buffer
+  local function snippet_after_edit(new_text, expected)
+    exec_lua(function()
+      vim.o.completeopt = 'menuone,noselect'
+    end)
+    create_server('dummy', {
+      isIncomplete = false,
+      items = {
+        {
+          label = 'hello',
+          insertText = 'hello(${1:arg})',
+          insertTextFormat = 2,
+          additionalTextEdits = {
+            {
+              range = {
+                start = { line = 0, character = 0 },
+                ['end'] = { line = 0, character = 0 },
+              },
+              newText = new_text,
+            },
+          },
+        },
+      },
+    })
+    feed('ih<c-x><c-o>')
+    wait_for_pum()
+    feed('<C-n><C-y>')
+    eq(
+      expected,
+      exec_lua(function()
+        return vim.api.nvim_buf_get_lines(0, 0, -1, true)
+      end)
+    )
+  end
+
+  it('expands a snippet below an added line', function()
+    snippet_after_edit('import x\n', { 'import x', 'hello(arg)' })
+  end)
+
+  it('expands a snippet after text added in front of it on the same line', function()
+    snippet_after_edit('X', { 'Xhello(arg)' })
+  end)
+
+  it('expands the snippet even when the buffer moves during resolve', function()
+    exec_lua(function()
+      vim.o.completeopt = 'menuone,noselect'
+      local server = _G._create_server({
+        capabilities = { completionProvider = { resolveProvider = true } },
+        handlers = {
+          ['textDocument/completion'] = function(_, _, callback)
+            callback(nil, {
+              isIncomplete = false,
+              items = {
+                { label = 'hello', insertText = 'hello(${1:arg})', insertTextFormat = 2 },
+              },
+            })
+          end,
+          ['completionItem/resolve'] = function(_, item, callback)
+            vim.api.nvim_buf_set_lines(0, -1, -1, false, { 'moved' })
+            callback(nil, item)
+          end,
+        },
+      })
+      vim.api.nvim_win_set_buf(0, vim.api.nvim_get_current_buf())
+      vim.lsp.start({
+        name = 'dummy',
+        cmd = server.cmd,
+        on_attach = function(client, bufnr0)
+          vim.lsp.completion.enable(true, client.id, bufnr0)
+        end,
+      })
+    end)
+
+    feed('ih<c-x><c-o>')
+    wait_for_pum()
+    feed('<C-n><C-y>')
+
+    retry(nil, nil, function()
+      eq(
+        { 'hello(arg)', 'moved' },
+        exec_lua(function()
+          return vim.api.nvim_buf_get_lines(0, 0, -1, true)
+        end)
+      )
+    end)
   end)
 
   it('clear multiple-lines word', function()
@@ -1488,6 +1810,366 @@ describe('vim.lsp.completion: integration', function()
     eq({ 1, 17 }, n.api.nvim_win_get_cursor(0))
   end)
 
+  it('requeries an incomplete list on <BS>', function()
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert'
+      _G.count = 0
+      local server = _G._create_server({
+        capabilities = { completionProvider = { triggerCharacters = { 'h' } } },
+        handlers = {
+          ['textDocument/completion'] = function(_, _, callback)
+            _G.count = _G.count + 1
+            callback(nil, { isIncomplete = true, items = { { label = 'hello' } } })
+          end,
+        },
+      })
+      vim.lsp.start({
+        name = 'dummy',
+        cmd = server.cmd,
+        on_attach = function(client, bufnr)
+          vim.lsp.completion.enable(true, client.id, bufnr, { autotrigger = true })
+        end,
+      })
+    end)
+    local function wait(count)
+      retry(nil, nil, function()
+        eq(count, exec_lua('return _G.count'))
+      end)
+    end
+    feed('ih')
+    wait(1)
+    feed('e')
+    wait(2)
+    -- <BS> fires no InsertCharPre, so this one rides on CompleteChanged
+    feed('<BS>')
+    wait(3)
+  end)
+
+  it('stops re-querying an incomplete list after leaving the completion', function()
+    local completion_list = {
+      isIncomplete = true,
+      items = { { label = 'wp_handle' } },
+    }
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert'
+    end)
+    local client_id = create_server('dummy', completion_list, { trigger_chars = { '>' } })
+
+    feed('iwp-><C-x><C-o>')
+    wait_for_pum()
+    feed('<BS><BS>')
+    n.poke_eventloop()
+    -- not a trigger character
+    feed('-')
+    n.poke_eventloop()
+    eq(0, n.fn.pumvisible())
+    assert_cleanup_after_detach(client_id)
+  end)
+
+  it('anchors an item without a text edit at overlapping text #30905', function()
+    -- The `\\k*$` boundary sits behind the `/`, and the snippet begins with one.
+    local completion_list = {
+      isIncomplete = false,
+      items = {
+        {
+          label = '/**',
+          insertTextFormat = 2,
+          insertText = '/** ${1:hello} */',
+        },
+      },
+    }
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert'
+    end)
+    local client_id = create_server('dummy', completion_list)
+    feed('A/<C-x><C-O>')
+    wait_for_pum()
+    feed('<C-Y>')
+    eq('/** hello */', n.api.nvim_get_current_line())
+    assert_cleanup_after_detach(client_id)
+  end)
+
+  describe('a match that replaces text in front of the word', function()
+    -- clangd's dot-to-arrow: the edit replaces the `.`, filterText is the member.
+    local completion_list = {
+      isIncomplete = false,
+      items = {
+        {
+          filterText = 'member',
+          insertTextFormat = 1,
+          kind = 5,
+          label = ' member',
+          textEdit = {
+            newText = '->member',
+            range = {
+              start = { character = 1, line = 0 },
+              ['end'] = { character = 2, line = 0 },
+            },
+          },
+        },
+      },
+    }
+
+    it('shows the text it is filtered by while selected, and applies on accept', function()
+      exec_lua(function()
+        vim.o.completeopt = 'menu,menuone'
+      end)
+      local client_id = create_server('dummy', completion_list)
+      feed('ip.<C-x><C-o>')
+      wait_for_pum()
+      -- The popup menu is placed from the session column, so the buffer keeps
+      -- the text this match is filtered by until it is accepted.
+      eq('p.member', n.api.nvim_get_current_line())
+      feed('<C-y>')
+      eq('p->member', n.api.nvim_get_current_line())
+      assert_cleanup_after_detach(client_id)
+    end)
+
+    it("is previewed, not written, with 'preinsert'", function()
+      exec_lua(function()
+        vim.o.completeopt = 'menu,menuone,preinsert'
+      end)
+      local client_id = create_server('dummy', completion_list)
+      feed('ip.<C-x><C-o>')
+      wait_for_pum()
+      -- The preview continues what was typed, so it shows the member rather
+      -- than the `->` the edit puts in its place.
+      eq('p.', n.api.nvim_get_current_line())
+      eq('member', preview_text())
+      feed('<C-y>')
+      eq('p->member', n.api.nvim_get_current_line())
+      eq(nil, preview_text())
+      assert_cleanup_after_detach(client_id)
+    end)
+
+    it("is not applied when the 'preinsert' preview is dropped", function()
+      exec_lua(function()
+        vim.o.completeopt = 'menu,menuone,preinsert'
+      end)
+      local client_id = create_server('dummy', completion_list)
+      feed('ip.<C-x><C-o>')
+      wait_for_pum()
+      eq('member', preview_text())
+      -- Leaving Insert mode without accepting: the preview was never in the
+      -- buffer, so there is nothing of the match left behind.
+      feed('<Esc>')
+      eq('p.', n.api.nvim_get_current_line())
+      eq(nil, preview_text())
+      assert_cleanup_after_detach(client_id)
+    end)
+
+    it('is taken back when insert mode ends', function()
+      -- The line holds what the match is filtered by, not what it produces, so
+      -- leaving owes the typed text back the way CTRL-E does.
+      exec_lua(function()
+        vim.o.completeopt = 'menu,menuone'
+      end)
+      local client_id = create_server('dummy', completion_list)
+      feed('ip.<C-x><C-o>')
+      wait_for_pum()
+      feed('<Esc>')
+      eq('p.', n.api.nvim_get_current_line())
+      assert_cleanup_after_detach(client_id)
+    end)
+
+    it('is not applied by a character that ends the completion', function()
+      exec_lua(function()
+        vim.o.completeopt = 'menu,menuone'
+      end)
+      local client_id = create_server('dummy', completion_list)
+      feed('ip.<C-x><C-o>')
+      wait_for_pum()
+      feed('(')
+      eq('p.(', n.api.nvim_get_current_line())
+      assert_cleanup_after_detach(client_id)
+    end)
+
+    it('is applied by CTRL-Y', function()
+      exec_lua(function()
+        vim.o.completeopt = 'menu,menuone'
+      end)
+      local client_id = create_server('dummy', completion_list)
+      feed('ip.<C-x><C-o>')
+      wait_for_pum()
+      feed('<C-y>')
+      eq('p->member', n.api.nvim_get_current_line())
+      assert_cleanup_after_detach(client_id)
+    end)
+
+    it('is repeated whole by "."', function()
+      exec_lua(function()
+        vim.o.completeopt = 'menu,menuone'
+      end)
+      local client_id = create_server('dummy', completion_list)
+      -- a line to repeat onto; `o` would become the change "." repeats
+      n.api.nvim_buf_set_lines(0, 0, -1, true, { '', '' })
+      feed('ip.<C-x><C-o>')
+      wait_for_pum()
+      feed('<C-y><Esc>')
+      eq('p->member', n.api.nvim_get_current_line())
+      feed('j.')
+      eq('p->member', n.api.nvim_get_current_line())
+      assert_cleanup_after_detach(client_id)
+    end)
+
+    it('is not left half-applied by a backspace', function()
+      exec_lua(function()
+        vim.o.completeopt = 'menu,menuone'
+      end)
+      local client_id = create_server('dummy', completion_list)
+      feed('ip.mem<C-x><C-o>')
+      wait_for_pum()
+      eq('p.member', n.api.nvim_get_current_line())
+      feed('<BS>')
+      -- preview out whole, then one char off the leader
+      eq('p.me', n.api.nvim_get_current_line())
+      assert_cleanup_after_detach(client_id)
+    end)
+
+    it('keeps the preview when an incomplete list is refreshed', function()
+      exec_lua(function()
+        vim.o.completeopt = 'menu,menuone,preinsert'
+      end)
+      local incomplete = vim.deepcopy(completion_list)
+      incomplete.isIncomplete = true
+      local client_id = create_server('dummy', incomplete)
+      feed('ip.<C-x><C-o>')
+      wait_for_pum()
+      eq('member', preview_text())
+      -- An incomplete list re-requests as the leader grows, which replaces the
+      -- whole list.  The preview has to be redrawn off the new one.
+      feed('m')
+      retry(nil, nil, function()
+        eq('ember', preview_text())
+      end)
+      eq('p.m', n.api.nvim_get_current_line())
+      assert_cleanup_after_detach(client_id)
+    end)
+
+    it("backspaces the typed text, not the preview, with 'preinsert'", function()
+      exec_lua(function()
+        vim.o.completeopt = 'menu,menuone,preinsert'
+      end)
+      local client_id = create_server('dummy', completion_list)
+      feed('ip.<C-x><C-o>')
+      wait_for_pum()
+      feed('m')
+      wait_for_pum()
+      feed('<BS>')
+      eq('p.', n.api.nvim_get_current_line())
+      assert_cleanup_after_detach(client_id)
+    end)
+
+    it('is repeated whole by "." with \'preinsert\'', function()
+      exec_lua(function()
+        vim.o.completeopt = 'menu,menuone,preinsert'
+      end)
+      local client_id = create_server('dummy', completion_list)
+      n.api.nvim_buf_set_lines(0, 0, -1, true, { '', '' })
+      feed('ip.<C-x><C-o>')
+      wait_for_pum()
+      feed('<C-y><Esc>')
+      eq('p->member', n.api.nvim_get_current_line())
+      feed('j.')
+      eq('p->member', n.api.nvim_get_current_line())
+      assert_cleanup_after_detach(client_id)
+    end)
+
+    it('adds from the filter text, not the edit text, on CTRL-L', function()
+      exec_lua(function()
+        vim.o.completeopt = 'menu,menuone,preinsert'
+      end)
+      local client_id = create_server('dummy', completion_list)
+      feed('ip.<C-x><C-o>')
+      wait_for_pum()
+      -- One character, and from what the leader is compared against: taking it
+      -- from the edit would add the `-` of "->member".
+      feed('<C-l>')
+      eq('p.m', n.api.nvim_get_current_line())
+      eq('ember', preview_text())
+      assert_cleanup_after_detach(client_id)
+    end)
+
+    it('is undone by CTRL-E', function()
+      exec_lua(function()
+        vim.o.completeopt = 'menu,menuone'
+      end)
+      local client_id = create_server('dummy', completion_list)
+      feed('ip.<C-x><C-o>')
+      wait_for_pum()
+      eq('p.member', n.api.nvim_get_current_line())
+      feed('<C-e>')
+      eq('p.', n.api.nvim_get_current_line())
+      assert_cleanup_after_detach(client_id)
+    end)
+  end)
+
+  it('applies an edit that replaces text in front of the word', function()
+    -- clangd's dot-to-arrow: the edit replaces the `.`, filterText is the member.
+    local function member(name, text)
+      return {
+        detail = 'int',
+        filterText = name,
+        insertTextFormat = 1,
+        kind = 5,
+        label = ' ' .. name,
+        sortText = '4122d903' .. name,
+        textEdit = {
+          newText = text,
+          range = {
+            start = { character = 2, line = 0 },
+            ['end'] = { character = 3, line = 0 },
+          },
+        },
+      }
+    end
+    local completion_list = {
+      isIncomplete = true,
+      items = {
+        member('handle', '->handle'),
+        member('w_alt_fnum', '->w_alt_fnum'),
+        -- reverse correction, as a snippet
+        {
+          detail = 'pointer',
+          filterText = 'get',
+          insertText = '.get()',
+          insertTextFormat = 2,
+          kind = 2,
+          label = ' get',
+          labelDetails = { detail = '() const' },
+          sortText = '411198afget',
+          textEdit = {
+            newText = '.get()',
+            range = {
+              start = { character = 2, line = 0 },
+              ['end'] = { character = 4, line = 0 },
+            },
+          },
+        },
+      },
+    }
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert'
+    end)
+    local client_id = create_server('dummy', completion_list)
+
+    feed('iwp.<c-x><c-o>')
+    wait_for_pum()
+    feed('w')
+    wait_for_pum()
+    feed('<C-y>')
+    eq('wp->w_alt_fnum', n.api.nvim_get_current_line())
+    eq({ 1, 14 }, n.api.nvim_win_get_cursor(0))
+
+    -- again for a snippet, all-non-word leader
+    n.command('set completeopt+=longest') --- #39001
+    feed('<ESC>Swp-><C-x><C-O>')
+    wait_for_pum()
+    feed('<C-N><C-y>')
+    eq('wp.get()', n.api.nvim_get_current_line())
+    assert_cleanup_after_detach(client_id)
+  end)
+
   it('sorts items when fuzzy is enabled and prefix not empty #33610', function()
     local completion_list = {
       isIncomplete = false,
@@ -1526,6 +2208,585 @@ describe('vim.lsp.completion: integration', function()
     wait_for_pum()
     feed('<C-y>')
     eq('w-1/2', n.api.nvim_get_current_line())
+  end)
+
+  it("takes the whole match back under 'ignorecase'", function()
+    -- The line holds "Hello" while the leader is "he": deleting down to the
+    -- common prefix of compl_orig_text and the leader would keep "He".
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone'
+      vim.o.ignorecase = true
+    end)
+    local client_id = create_server('dummy', {
+      isIncomplete = false,
+      items = { { label = 'Hello' }, { label = 'Helper' } },
+    })
+
+    feed('ihe<C-x><C-o>')
+    wait_for_pum()
+    eq('Hello', n.api.nvim_get_current_line())
+    feed('l<C-e>')
+    -- "hel", not "Hel": what was typed came back before the character landed.
+    eq('hel', n.api.nvim_get_current_line())
+    assert_cleanup_after_detach(client_id)
+  end)
+
+  it("takes the whole match back under 'fuzzy'", function()
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,fuzzy'
+    end)
+    local client_id = create_server('dummy', {
+      isIncomplete = false,
+      items = { { label = 'hello' } },
+    })
+
+    feed('ihl<C-x><C-o>')
+    wait_for_pum()
+    feed('o<C-e>')
+    -- "hlo", not "heo": the match does not begin with the leader here.
+    eq('hlo', n.api.nvim_get_current_line())
+    assert_cleanup_after_detach(client_id)
+  end)
+
+  it('reports "replace" when it takes over a native completion', function()
+    exec_lua(function()
+      vim.o.completeopt = 'menu'
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'hello', '' })
+      vim.api.nvim_win_set_cursor(0, { 2, 0 })
+      _G.reasons = {}
+      vim.api.nvim_create_autocmd('CompleteDone', {
+        callback = function()
+          table.insert(_G.reasons, vim.v.event.reason)
+        end,
+      })
+    end)
+    local client_id = create_server('dummy', {
+      isIncomplete = false,
+      items = { { label = 'hello' } },
+    })
+
+    feed('ih<C-n>')
+    n.poke_eventloop()
+    feed('<C-x><C-o>')
+    retry(nil, nil, function()
+      eq({ 'replace' }, exec_lua('return _G.reasons'))
+    end)
+    assert_cleanup_after_detach(client_id)
+  end)
+
+  it('leaves the line alone when a new batch drops the inserted match', function()
+    -- A second round answers with a list the inserted match is not in: that is
+    -- a batch arriving, not the user picking something else.
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone'
+      _G.round = 0
+    end)
+    local client_id = exec_lua(function()
+      local server = _G._create_server({
+        capabilities = { completionProvider = { triggerCharacters = { '.' } } },
+        handlers = {
+          ['textDocument/completion'] = function(_, _, callback)
+            _G.round = _G.round + 1
+            callback(nil, {
+              isIncomplete = _G.round == 1,
+              items = _G.round == 1 and { { label = 'hello' } } or { { label = 'helper' } },
+            })
+          end,
+        },
+      })
+      local id = vim.lsp.start({ name = 'dummy', cmd = server.cmd })
+      vim.lsp.completion.enable(true, id, 0, { autotrigger = true })
+      return id
+    end)
+
+    feed('ih<C-x><C-o>')
+    wait_for_pum()
+    eq('hello', n.api.nvim_get_current_line())
+    feed('e')
+    retry(nil, nil, function()
+      assert(exec_lua('return _G.round') > 1)
+    end)
+    -- "he" is what was typed; "helper" is only offered.
+    eq('he', n.api.nvim_get_current_line())
+    assert_cleanup_after_detach(client_id)
+  end)
+
+  it('drops a buffer word a server already offered', function()
+    -- The completion server ranks first here, so a single pass collecting as it
+    -- goes would reach it with nothing seen yet.
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert'
+      -- "hint" is the buffer's alone, so it says the keyword source answered.
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'hello hint', '' })
+      vim.api.nvim_win_set_cursor(0, { 2, 0 })
+    end)
+    local client_id = create_server('dummy', {
+      isIncomplete = false,
+      items = { { label = 'hello', kind = 3 } },
+    })
+    exec_lua(function(id)
+      local completion = require('vim._core.completion')
+      completion.enable(true, 0, {
+        sources = { completion.source.keyword, completion.source.lsp({ client_id = id }) },
+      })
+    end, client_id)
+
+    feed('ih<C-x><C-o>')
+    wait_for_pum()
+    -- Both answered: without that, one "hello" proves nothing about deduping.
+    retry(nil, nil, function()
+      local words = vim.tbl_map(function(m)
+        return m.word
+      end, n.fn.complete_info({ 'matches' }).matches)
+      assert(vim.list_contains(words, 'hello') and vim.list_contains(words, 'hint'))
+    end)
+    local hellos = vim.tbl_filter(function(m)
+      return m.word == 'hello'
+    end, n.fn.complete_info({ 'matches' }).matches)
+    -- One, and the server's: a buffer word carries the Text kind instead.  Both
+    -- clients answer the same round, so this fails if either is missing.
+    eq(1, #hellos)
+    eq('Function', hellos[1].kind)
+    assert_cleanup_after_detach(client_id)
+  end)
+
+  it('walks the same way after a replacing batch', function()
+    -- compl_shows_dir is read by the key after the batch, in
+    -- ins_compl_new_leader(), so the direction has to survive the replace.
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert'
+      _G.round = 0
+    end)
+    local client_id = exec_lua(function()
+      local server = _G._create_server({
+        capabilities = { completionProvider = {} },
+        handlers = {
+          ['textDocument/completion'] = function(_, _, callback)
+            _G.round = _G.round + 1
+            callback(nil, {
+              isIncomplete = _G.round == 1,
+              -- All three survive a leader of "hea".
+              items = { { label = 'heap' }, { label = 'heat' }, { label = 'head' } },
+            })
+          end,
+        },
+      })
+      local id = vim.lsp.start({ name = 'dummy', cmd = server.cmd })
+      vim.lsp.completion.enable(true, id, 0, { autotrigger = true })
+      return id
+    end)
+
+    feed('ihe<C-x><C-o>')
+    wait_for_pum()
+    feed('<C-p>')
+    feed('a')
+    retry(nil, nil, function()
+      assert(exec_lua('return _G.round') > 1)
+    end)
+    eq(3, #n.fn.complete_info({ 'matches' }).matches)
+
+    -- Backwards from wherever the batch left the selection, which a direction
+    -- reset to FORWARD would turn around.
+    local at = n.fn.complete_info({ 'selected' }).selected
+    feed('<C-p>')
+    local after = n.fn.complete_info({ 'selected' }).selected
+    eq(at == 0 and -1 or at - 1, after)
+    assert_cleanup_after_detach(client_id)
+  end)
+
+  it("ignores a preselect from a replacing batch under 'noselect'", function()
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noselect'
+      _G.round = 0
+    end)
+    local client_id = exec_lua(function()
+      local server = _G._create_server({
+        capabilities = { completionProvider = {} },
+        handlers = {
+          ['textDocument/completion'] = function(_, _, callback)
+            _G.round = _G.round + 1
+            callback(nil, {
+              isIncomplete = _G.round == 1,
+              -- Both survive a leader of "hea", so the preselect is live.
+              items = { { label = 'heap' }, { label = 'heat', preselect = true } },
+            })
+          end,
+        },
+      })
+      local id = vim.lsp.start({ name = 'dummy', cmd = server.cmd })
+      vim.lsp.completion.enable(true, id, 0, { autotrigger = true })
+      return id
+    end)
+
+    feed('ihe<C-x><C-o>')
+    wait_for_pum()
+    feed('a')
+    retry(nil, nil, function()
+      assert(exec_lua('return _G.round') > 1)
+    end)
+    eq(2, #n.fn.complete_info({ 'matches' }).matches)
+    -- "noselect" means nothing is selected, whichever batch brought the item.
+    eq(-1, n.fn.complete_info({ 'selected' }).selected)
+    assert_cleanup_after_detach(client_id)
+  end)
+
+  it("ignores a preselect from a replacing batch under 'longest'", function()
+    -- set_completion() treats "longest" as "noselect" too, and so does replace.
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,longest'
+      _G.round = 0
+    end)
+    local client_id = exec_lua(function()
+      local server = _G._create_server({
+        capabilities = { completionProvider = {} },
+        handlers = {
+          ['textDocument/completion'] = function(_, _, callback)
+            _G.round = _G.round + 1
+            callback(nil, {
+              isIncomplete = _G.round == 1,
+              items = { { label = 'heap' }, { label = 'heat', preselect = true } },
+            })
+          end,
+        },
+      })
+      local id = vim.lsp.start({ name = 'dummy', cmd = server.cmd })
+      vim.lsp.completion.enable(true, id, 0, { autotrigger = true })
+      return id
+    end)
+
+    feed('ihe<C-x><C-o>')
+    wait_for_pum()
+    feed('a')
+    retry(nil, nil, function()
+      assert(exec_lua('return _G.round') > 1)
+    end)
+    eq(2, #n.fn.complete_info({ 'matches' }).matches)
+    eq(-1, n.fn.complete_info({ 'selected' }).selected)
+    assert_cleanup_after_detach(client_id)
+  end)
+
+  it('orders by how well an item matches, not by which client sent it', function()
+    -- The completion server ranks first, so a client-by-client order would put
+    -- its fuzzy match in front of the server's exact one.
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert,fuzzy'
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'hxexlxlxo', '' })
+      vim.api.nvim_win_set_cursor(0, { 2, 0 })
+    end)
+    local client_id = create_server('dummy', {
+      isIncomplete = false,
+      items = { { label = 'hello' } },
+    })
+    exec_lua(function(id)
+      local completion = require('vim._core.completion')
+      completion.enable(true, 0, {
+        sources = { completion.source.keyword, completion.source.lsp({ client_id = id }) },
+      })
+    end, client_id)
+
+    feed('ihello<C-x><C-o>')
+    retry(nil, nil, function()
+      local words = vim.tbl_map(function(m)
+        return m.word
+      end, n.fn.complete_info({ 'matches' }).matches)
+      assert(vim.list_contains(words, 'hello') and vim.list_contains(words, 'hxexlxlxo'))
+      eq('hello', words[1])
+    end)
+    assert_cleanup_after_detach(client_id)
+  end)
+
+  it('stops asking once a client answers completely', function()
+    -- isIncomplete = false is a contract: another character narrows what is
+    -- here, so the client filters rather than asking again.
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert'
+      _G.round = 0
+    end)
+    local client_id = exec_lua(function()
+      local server = _G._create_server({
+        capabilities = { completionProvider = {} },
+        handlers = {
+          ['textDocument/completion'] = function(_, _, callback)
+            _G.round = _G.round + 1
+            callback(nil, { isIncomplete = false, items = { { label = 'hello' } } })
+          end,
+        },
+      })
+      local id = vim.lsp.start({ name = 'dummy', cmd = server.cmd })
+      vim.lsp.completion.enable(true, id, 0, { identifier = true })
+      return id
+    end)
+
+    feed('ih')
+    retry(nil, nil, function()
+      eq(1, exec_lua('return _G.round'))
+    end)
+    feed('<C-e>e')
+    n.poke_eventloop()
+    -- The word is the one already answered for, so nothing new was asked.
+    eq(1, exec_lua('return _G.round'))
+    assert_cleanup_after_detach(client_id)
+  end)
+
+  it('leaves a client the caller enabled itself alone', function()
+    -- owned: vim._core.completion turns off what it turned on, and nothing else.
+    local client_id = create_server('dummy', {
+      isIncomplete = false,
+      items = { { label = 'hello' } },
+    })
+    exec_lua(function(id)
+      vim.lsp.completion.enable(true, id, 0, { autotrigger = true })
+      local completion = require('vim._core.completion')
+      completion.enable(true, 0, { sources = { completion.source.keyword } })
+      completion.enable(false, 0)
+    end, client_id)
+
+    feed('ih.')
+    retry(nil, nil, function()
+      assert(#exec_lua('return _G.server.messages') > 0)
+    end)
+    assert_cleanup_after_detach(client_id)
+  end)
+
+  it('keeps the same word from two clients that both own it', function()
+    -- "dup" is theirs to set: only a secondary client gives way.
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert'
+    end)
+    local client1 = create_server('dummy1', {
+      isIncomplete = false,
+      items = { { label = 'hello' } },
+    })
+    local client2 = create_server('dummy2', {
+      isIncomplete = false,
+      items = { { label = 'hello' } },
+    })
+
+    feed('ih<C-x><C-o>')
+    wait_for_pum()
+    retry(nil, nil, function()
+      local hellos = vim.tbl_filter(function(m)
+        return m.word == 'hello'
+      end, n.fn.complete_info({ 'matches' }).matches)
+      eq(2, #hellos)
+    end)
+    assert_cleanup_after_detach(client1)
+    assert_cleanup_after_detach(client2)
+  end)
+
+  it("orders two servers' items by rank when nothing scores them", function()
+    -- Without "fuzzy" there are no scores, and sortText ranks a server's items
+    -- among its own: the caller's order is what is left to go on.
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert'
+    end)
+    local first = create_server('dummy1', {
+      isIncomplete = false,
+      items = { { label = 'hzz', sortText = 'zzz' } },
+    })
+    local second = create_server('dummy2', {
+      isIncomplete = false,
+      items = { { label = 'haa', sortText = 'aaa' } },
+    })
+    exec_lua(function(a, b)
+      vim.lsp.completion.enable(true, a, 0, { rank = 1 })
+      vim.lsp.completion.enable(true, b, 0, { rank = 2 })
+    end, first, second)
+
+    feed('ih<C-x><C-o>')
+    wait_for_pum()
+    retry(nil, nil, function()
+      local words = vim.tbl_map(function(m)
+        return m.word
+      end, n.fn.complete_info({ 'matches' }).matches)
+      -- "hzz" first: rank beats the sortText that would sort "haa" ahead.
+      eq({ 'hzz', 'haa' }, words)
+    end)
+    assert_cleanup_after_detach(first)
+    assert_cleanup_after_detach(second)
+  end)
+
+  it('does not sink an incomplete list under a scored one', function()
+    -- A server calling its list incomplete gives its items no score, and an
+    -- absent score is not a zero.
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert,fuzzy'
+    end)
+    local incomplete = create_server('dummy1', {
+      isIncomplete = true,
+      items = { { label = 'hab' } },
+    })
+    local whole = create_server('dummy2', {
+      isIncomplete = false,
+      items = { { label = 'hzb' } },
+    })
+    exec_lua(function(a, b)
+      vim.lsp.completion.enable(true, a, 0, { rank = 1 })
+      vim.lsp.completion.enable(true, b, 0, { rank = 2 })
+    end, incomplete, whole)
+
+    feed('ihb<C-x><C-o>')
+    wait_for_pum()
+    retry(nil, nil, function()
+      local words = vim.tbl_map(function(m)
+        return m.word
+      end, n.fn.complete_info({ 'matches' }).matches)
+      eq(2, #words)
+      -- The unscored one keeps its rank rather than falling to the bottom.
+      eq('hab', words[1])
+    end)
+    assert_cleanup_after_detach(incomplete)
+    assert_cleanup_after_detach(whole)
+  end)
+
+  it('orders a partial round by rank alone', function()
+    -- Three items, no rank between the clients, and one list the server calls
+    -- partial: scoring only the pairs that both have a score is not an ordering,
+    -- and table.sort() on one of those gives back anything.
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert,fuzzy'
+    end)
+    local scored = create_server('dummy1', {
+      isIncomplete = false,
+      items = { { label = 'hb' }, { label = 'haab' } },
+    })
+    local partial = create_server('dummy2', {
+      isIncomplete = true,
+      items = { { label = 'hab' } },
+    })
+
+    feed('ihb<C-x><C-o>')
+    wait_for_pum()
+    retry(nil, nil, function()
+      local words = vim.tbl_map(function(m)
+        return m.word
+      end, n.fn.complete_info({ 'matches' }).matches)
+      -- No rank between them and no scores in play, so by label: consulting
+      -- the scores here would order some pairs and not others.
+      eq({ 'haab', 'hab', 'hb' }, words)
+    end)
+    assert_cleanup_after_detach(scored)
+    assert_cleanup_after_detach(partial)
+  end)
+
+  describe('enable(…,{insert_mode=…})', function()
+    -- Both ranges start at the word; the replace one covers what follows it.
+    local completion_list = {
+      isIncomplete = false,
+      items = {
+        {
+          label = 'foobaz',
+          textEdit = {
+            newText = 'foobaz',
+            insert = {
+              start = { character = 0, line = 0 },
+              ['end'] = { character = 3, line = 0 },
+            },
+            replace = {
+              start = { character = 0, line = 0 },
+              ['end'] = { character = 6, line = 0 },
+            },
+          },
+        },
+      },
+    }
+
+    before_each(function()
+      exec_lua(function()
+        vim.o.completeopt = 'menu,menuone,noinsert'
+      end)
+    end)
+
+    it('leaves the text after the cursor by default', function()
+      local client_id = create_server('dummy', completion_list)
+      feed('ifoobar<Esc>2hi<C-x><C-o>')  -- cursor after "foo"
+      wait_for_pum()
+      feed('<C-y>')
+      eq('foobazbar', n.api.nvim_get_current_line())
+      assert_cleanup_after_detach(client_id)
+    end)
+
+    it("removes what the replace range covers with 'replace'", function()
+      local client_id = create_server('dummy', completion_list, { insert_mode = 'replace' })
+      feed('ifoobar<Esc>2hi<C-x><C-o>')  -- cursor after "foo"
+      wait_for_pum()
+      feed('<C-y>')
+      eq('foobaz', n.api.nvim_get_current_line())
+      assert_cleanup_after_detach(client_id)
+    end)
+
+    it("leaves a plain text edit alone under 'replace'", function()
+      local plain = {
+        isIncomplete = false,
+        items = {
+          {
+            label = 'foobaz',
+            textEdit = {
+              newText = 'foobaz',
+              range = {
+                start = { character = 0, line = 0 },
+                ['end'] = { character = 3, line = 0 },
+              },
+            },
+          },
+        },
+      }
+      local client_id = create_server('dummy', plain, { insert_mode = 'replace' })
+      feed('ifoobar<Esc>2hi<C-x><C-o>')  -- cursor after "foo"
+      wait_for_pum()
+      feed('<C-y>')
+      eq('foobazbar', n.api.nvim_get_current_line())
+      assert_cleanup_after_detach(client_id)
+    end)
+
+    it("leaves a replace range that leaves the line alone under 'replace'", function()
+      local multiline = {
+        isIncomplete = false,
+        items = {
+          {
+            label = 'foobaz',
+            textEdit = {
+              newText = 'foobaz',
+              insert = {
+                start = { character = 0, line = 0 },
+                ['end'] = { character = 3, line = 0 },
+              },
+              replace = {
+                start = { character = 0, line = 0 },
+                ['end'] = { character = 2, line = 1 },
+              },
+            },
+          },
+        },
+      }
+      local client_id = create_server('dummy', multiline, { insert_mode = 'replace' })
+      feed('ifoobar<Esc>2hi<C-x><C-o>')  -- cursor after "foo"
+      wait_for_pum()
+      feed('<C-y>')
+      -- A session lives on one line, so a range reaching off it is not applied.
+      eq('foobazbar', n.api.nvim_get_current_line())
+      assert_cleanup_after_detach(client_id)
+    end)
+  end)
+
+  it("preinserted() covers 'longest', not the 'preinsert' preview", function()
+    local completion_list = {
+      isIncomplete = false,
+      items = { { label = 'hello' }, { label = 'help' } },
+    }
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,preinsert'
+    end)
+    local client_id = create_server('dummy', completion_list)
+    feed('ihe<C-x><C-o>')
+    wait_for_pum()
+    -- The preview is virtual text, so the buffer holds only the leader and
+    -- neither of these can see it.
+    eq('he', n.api.nvim_get_current_line())
+    eq('llo', preview_text())
+    eq(0, n.fn.preinserted())
+    eq('', n.fn.complete_info({ 'preinserted_text' }).preinserted_text)
+    assert_cleanup_after_detach(client_id)
   end)
 
   describe('selecting an item triggers (snippet) preview', function()
@@ -1876,6 +3137,145 @@ describe('vim.lsp.completion: integration', function()
     feed('=')
     eq('f.bar=', n.api.nvim_get_current_line())
   end)
+
+  it('keeps an item that starts after the session column', function()
+    -- 'iskeyword' has the `.`, so `\k*$` on `obj.fiel` starts at column 0 while
+    -- the server's range starts after the dot.  The column is per item, so the
+    -- text in between belongs to what the item leaves alone.
+    local completion_list = {
+      isIncomplete = false,
+      items = {
+        {
+          label = 'field',
+          textEdit = {
+            newText = 'field',
+            range = {
+              start = { character = 4, line = 0 },
+              ['end'] = { character = 8, line = 0 },
+            },
+          },
+        },
+      },
+    }
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert'
+      vim.bo.iskeyword = vim.bo.iskeyword .. ',.'
+    end)
+    local client_id = create_server('dummy', completion_list)
+    feed('iobj.fiel<C-x><C-o>')
+    wait_for_pum()
+    feed('<C-y>')
+    eq('obj.field', n.api.nvim_get_current_line())
+    assert_cleanup_after_detach(client_id)
+  end)
+
+  it('repeats an item that starts after the session column with "."', function()
+    local completion_list = {
+      isIncomplete = false,
+      items = {
+        {
+          label = 'field2',
+          textEdit = {
+            newText = 'field2',
+            range = {
+              start = { character = 4, line = 0 },
+              ['end'] = { character = 7, line = 0 },
+            },
+          },
+        },
+      },
+    }
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert'
+      vim.bo.iskeyword = vim.bo.iskeyword .. ',.'
+    end)
+    local client_id = create_server('dummy', completion_list)
+    feed('iobj.fie<C-x><C-o>')
+    wait_for_pum()
+    feed('<C-y><Esc>')
+    eq('obj.field2', n.api.nvim_get_current_line())
+    -- The text before the item's column is not part of what it replaced.
+    feed('o<Esc>.')
+    eq({ 'obj.field2', '', 'obj.field2' }, n.api.nvim_buf_get_lines(0, 0, -1, true))
+    assert_cleanup_after_detach(client_id)
+  end)
+
+  it('drops its session when the buffer is left mid-completion', function()
+    -- A <Cmd> map or an autocommand can switch buffer without leaving Insert
+    -- mode, and the engine then cancels its session with the other buffer
+    -- already current -- our CompleteDone never runs for this one.  The id has
+    -- to go here, or a later native <C-n> in this buffer would be taken over.
+    local client_id = create_server('dummy', {
+      isIncomplete = false,
+      items = { { label = 'hello' } },
+    })
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert'
+      _G.other = vim.api.nvim_create_buf(true, true)
+    end)
+    feed('ihe<C-x><C-o>')
+    wait_for_pum()
+    exec_lua(function()
+      vim.api.nvim_set_current_buf(_G.other)
+    end)
+    n.poke_eventloop()
+    exec_lua(function()
+      vim.api.nvim_set_current_buf(vim.fn.bufnr('#'))
+    end)
+
+    -- Native keyword completion, unclaimed.
+    feed('<Esc>ohello<CR>he<C-n>')
+    wait_for_pum()
+    eq('keyword', n.fn.complete_info({ 'mode' }).mode)
+    assert_cleanup_after_detach(client_id)
+  end)
+
+  it('takes back a match at the session column when typing continues', function()
+    -- The other half of take_back_match(): a replaceable session keeps running,
+    -- so its match is not what the user is accepting either.
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone'
+    end)
+    local client_id = create_server('dummy', {
+      isIncomplete = false,
+      items = { { label = 'hello' }, { label = 'helper' } },
+    })
+    feed('ih<C-x><C-o>')
+    wait_for_pum()
+    eq('hello', n.api.nvim_get_current_line())
+    feed('e')
+    retry(nil, nil, function()
+      -- Both still match: the leader is "he", not "helloe", so the match went
+      -- back before the character landed.
+      eq(2, #n.fn.complete_info({ 'matches' }).matches)
+    end)
+    assert_cleanup_after_detach(client_id)
+  end)
+
+  it('keeps the cached list when publishing takes over omni completion', function()
+    local completion_list = {
+      isIncomplete = true,
+      items = { { label = 'hello' }, { label = 'hercules' } },
+    }
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert'
+    end)
+    local client_id = create_server('dummy', completion_list)
+
+    -- <C-x><C-o> leaves a pending OMNI completion, which publish() takes over.
+    -- The engine calls that teardown a discard; the cache has to survive it, or
+    -- the incomplete list is never re-queried.
+    feed('ihe<C-x><C-o>')
+    wait_for_pum()
+    local before = exec_lua('return #_G.server.messages')
+    feed('<BS>')
+    retry(nil, nil, function()
+      assert(exec_lua('return #_G.server.messages') > before)
+    end)
+    eq('h', n.api.nvim_get_current_line())
+    assert_cleanup_after_detach(client_id)
+  end)
+
 end)
 
 describe("vim.lsp.completion: omnifunc + 'autocomplete'", function()

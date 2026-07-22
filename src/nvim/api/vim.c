@@ -87,6 +87,7 @@
 #include "nvim/terminal.h"
 #include "nvim/types_defs.h"
 #include "nvim/ui.h"
+#include "nvim/undo.h"
 #include "nvim/vim_defs.h"
 #include "nvim/window.h"
 
@@ -2447,6 +2448,99 @@ DictOf(Float) nvim__complete_set(Integer index, Dict(complete_set) *opts, Arena 
     }
   }
   return rv;
+}
+
+/// Starts, replaces or stops a completion session, as |ins-completion| would.
+///
+/// Unlike |complete()| a session started here keeps running while the leader is
+/// typed: the caller answers each new one by replacing the candidates, so an
+/// asynchronous source can hand over what it has and follow up.
+///
+/// @note Replacing the candidates of a session answers -1 when the session is
+///          gone or Insert mode has ended, since the caller is a batch that
+///          raced the user and has nothing to report; so does a "col" past the
+///          cursor or off a character boundary.  A buffer that cannot be
+///          changed answers -1 either way, saying why through a message, and a
+///          handler raising during the call is reported the same way once the
+///          session is up.
+///
+/// @param opts  Optional parameters.
+///              - col: (integer) 1-based byte column the candidates start at.
+///                Required to start a session.
+///              - items: (array) Candidates, see |complete-items|.  An empty
+///                list, or omitting them with an `id`, ends that session: one
+///                running on nothing still takes the keys |i_CTRL-N| and
+///                |i_CTRL-E| would go to.
+///              - id: (integer) Session to replace or stop, as returned here.
+/// @return Session id, or -1.
+Integer nvim__complete(Dict(complete) *opts, Error *err)
+  FUNC_API_SINCE(15)
+{
+  int64_t id = HAS_KEY(opts, complete, id) ? opts->id : 0;
+  VALIDATE(id >= 0, "Invalid 'id': %" PRId64, id, {
+    return -1;
+  });
+
+  if (!HAS_KEY(opts, complete, items) || opts->items.size == 0) {
+    VALIDATE(id > 0, "%s", "'items' is required to start a session", {
+      return -1;
+    });
+    // An id on its own ends that session: a caller with nothing left to show
+    // would otherwise leave it taking keys for candidates never coming.
+    if ((State & MODE_INSERT) == 0 || textlock != 0) {
+      return -1;  // it ends with Insert mode anyway
+    }
+    Integer stopped = -1;
+    TRY_WRAP(err, {  // ins_compl_prep() fires CompleteDone
+      stopped = ins_compl_stop_session(id);
+    });
+    return ERROR_SET(err) ? -1 : stopped;
+  }
+
+  if (id == 0) {
+    if ((State & MODE_INSERT) == 0) {
+      api_set_error(err, kErrorTypeException, "Insert mode required");
+      return -1;
+    }
+    VALIDATE(HAS_KEY(opts, complete, col)
+             && opts->col >= 1 && opts->col <= INT_MAX, "%s",
+             "'col' is required to start a session and must be a valid column", {
+      return -1;
+    });
+  } else if ((State & MODE_INSERT) == 0 || textlock != 0) {
+    return -1;
+  }
+
+  typval_T items_tv;
+  object_to_vim(ARRAY_OBJ(opts->items), &items_tv, err);
+  if (ERROR_SET(err)) {
+    tv_clear(&items_tv);
+    return -1;
+  }
+
+  // Checked here rather than inside TRY_WRAP, which would turn the emsg() into
+  // an error: replacing answers -1 for a caller that raced the user, and
+  // starting says why through the message undo_allowed() already printed.
+  if (!undo_allowed(curbuf)) {
+    tv_clear(&items_tv);
+    return -1;
+  }
+
+  Integer ret = -1;
+  TRY_WRAP(err, {
+    ret = id == 0
+          ? ins_compl_start_session((colnr_T)opts->col, items_tv.vval.v_list)
+          : ins_compl_replace_list(items_tv.vval.v_list, id);
+  });
+  tv_clear(&items_tv);
+  if (ret > 0 && ERROR_SET(err)) {
+    // The session is up, so the id has to reach the caller: nothing can look it
+    // up afterwards, and the engine would keep a session nobody answers for.
+    // What a CompleteChanged handler raised is reported as a message instead.
+    emsg(err->msg);
+    api_clear_error(err);
+  }
+  return ERROR_SET(err) ? -1 : ret;
 }
 
 static void redraw_status(win_T *wp, Dict(redraw) *opts, bool *flush)

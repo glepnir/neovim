@@ -34,6 +34,35 @@ function vim.api.nvim__cmdwin_set(type, buf) end
 
 --- WARNING: This feature is experimental/unstable.
 ---
+--- Starts, replaces or stops a completion session, as `ins-completion` would.
+---
+--- Unlike `complete()` a session started here keeps running while the leader is
+--- typed: the caller answers each new one by replacing the candidates, so an
+--- asynchronous source can hand over what it has and follow up.
+---
+--- Note:
+--- Replacing the candidates of a session answers -1 when the session is
+--- gone, when the buffer cannot be changed, or when Insert mode has
+--- ended, since the caller is a batch that raced the user and has
+--- nothing to report; so does a "col" past the cursor or off a
+--- character boundary, and a buffer that cannot be changed, which
+--- reports through a message.  A handler raising during the call is
+--- reported as a message once the session is up.
+---
+---
+--- @param opts vim.api.keyset.complete? Optional parameters.
+--- - col: (integer) 1-based byte column the candidates start at.
+---   Required to start a session.
+--- - id: (integer) Session to replace or stop, as returned here.
+--- - items: (array) Candidates, see `complete-items`.  An empty
+---   list, or omitting them with an `id`, ends that session: one
+---   running on nothing still takes the keys `i_CTRL-N` and
+---   `i_CTRL-E` would go to.
+--- @return integer # Session id, or -1.
+function vim.api.nvim__complete(opts) end
+
+--- WARNING: This feature is experimental/unstable.
+---
 --- Sets info for the completion item at the given index. If the info text was shown in a window,
 --- returns the window and buffer ids, or empty dict if not shown.
 ---

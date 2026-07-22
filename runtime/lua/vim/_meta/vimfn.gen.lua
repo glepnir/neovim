@@ -1115,6 +1115,9 @@ function vim.fn.complete(startcol, matches) end
 --- Returns 0 for failure (empty string or out of memory),
 --- 1 when the match was added, 2 when the match was already in
 --- the list.
+--- Also returns 0 while the candidates come from
+--- |nvim__complete()|: that caller replaces the whole list, so
+--- there is nothing to add to.
 --- See |complete-functions| for an explanation of {expr}.  It is
 --- the same as one item in the list that 'omnifunc' would return.
 ---
@@ -1161,8 +1164,9 @@ function vim.fn.complete_check() end
 ---    mode    Current completion mode name string.
 ---     See |complete_info_mode| for the values.
 ---    preinserted_text
----     The actual text that is pre-inserted, see
----     |preinserted()|.
+---     Deprecated.  The text "longest" inserted ahead of
+---     the cursor; empty for the "preinsert" preview,
+---     which is virtual text.  See |preinserted()|.
 ---    pum_visible  |TRUE| if popup menu is visible.
 ---     See |pumvisible()|.
 ---    selected  Selected item index.  First index is zero.
@@ -6830,10 +6834,14 @@ function vim.fn.perleval(expr) end
 --- @return number
 function vim.fn.pow(x, y) end
 
+--- @deprecated
 --- Returns non-zero if text has been inserted after the cursor
---- because "preinsert" is present in 'completeopt', or because
---- "longest" is present in 'completeopt' while 'autocomplete'
---- is active.  Otherwise returns zero.
+--- because "longest" is present in 'completeopt' while
+--- 'autocomplete' is active.  Otherwise returns zero.
+---
+--- The "preinsert" preview is virtual text, which this cannot
+--- report: read the extmark in the "nvim.completion.preinsert"
+--- namespace instead.
 ---
 --- @return number
 function vim.fn.preinserted() end

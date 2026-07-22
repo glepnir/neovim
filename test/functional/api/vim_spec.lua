@@ -6449,4 +6449,484 @@ describe('API', function()
       ^:call getchar()                         |
     ]])
   end)
+
+  describe('nvim__complete', function()
+    before_each(function()
+      clear()
+      command('set completeopt=menu,menuone,noselect')
+    end)
+
+    local function menu_words()
+      local words = {}
+      for _, item in ipairs(fn.complete_info({ 'items' }).items) do
+        table.insert(words, item.word)
+      end
+      return words
+    end
+
+    local function selected()
+      return fn.complete_info({ 'selected' }).selected
+    end
+
+    it('validates arguments', function()
+      eq(
+        'Insert mode required',
+        pcall_err(api.nvim__complete, { col = 1, items = { { word = 'x' } } })
+      )
+      feed('i')
+      -- An empty list reads the same as none: both end a session, and neither
+      -- starts one.
+      matches("'items' is required", pcall_err(api.nvim__complete, { col = 1 }))
+      matches("'items' is required", pcall_err(api.nvim__complete, { col = 1, items = {} }))
+      matches("'col' is required", pcall_err(api.nvim__complete, { items = { { word = 'x' } } }))
+      matches("Invalid 'id'", pcall_err(api.nvim__complete, { id = -1, items = {} }))
+      -- used to be truncated by (int)id
+      eq(-1, api.nvim__complete({ id = 5000000000, items = { { word = 'x' } } }))
+    end)
+
+    -- CHANGED (was 'starts, appends, replaces; old ids are fenced out'):
+    -- id != 0 now replaces the whole list instead of appending.
+    it('starts and replaces; old ids are fenced out', function()
+      feed('i')
+      local id1 = api.nvim__complete({ col = 1, items = { { word = 'a' }, { word = 'b' } } })
+      ok(id1 > 0)
+      eq(1, fn.pumvisible())
+      eq({ 'a', 'b' }, menu_words())
+
+      -- replace swaps the whole candidate list in place, keeping the session
+      eq(id1, api.nvim__complete({ id = id1, items = { { word = 'c' }, { word = 'd' } } }))
+      eq({ 'c', 'd' }, menu_words())
+      eq(-1, selected())
+
+      -- a fresh start must survive the double ins_compl_free() in set_completion()
+      local id2 = api.nvim__complete({ col = 1, items = { { word = 'x' } } })
+      ok(id2 > id1)
+      eq({ 'x' }, menu_words())
+      -- the previous session's id is now stale
+      eq(-1, api.nvim__complete({ id = id1, items = { { word = 'y' } } }))
+      eq({ 'x' }, menu_words())
+    end)
+
+    it('starts over native completion', function()
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'word1 word2', '' })
+      feed('Gi<C-n>')
+      eq(1, fn.pumvisible())
+      local id = api.nvim__complete({ col = 1, items = { { word = 'api1' } } })
+      ok(id > 0)
+      eq({ 'api1' }, menu_words())
+
+      -- An empty list ends the session rather than running it on nothing.
+      eq(id, api.nvim__complete({ id = id, items = {} }))
+      eq(0, fn.pumvisible())
+      eq(-1, api.nvim__complete({ id = id, items = { { word = 'e1' } } }))
+    end)
+
+    -- CHANGED (one line): a replace that lands after <Esc> now returns -1
+    -- instead of raising "Insert mode required".
+    it('ids go stale when the session ends', function()
+      feed('i')
+      local id = api.nvim__complete({ col = 1, items = { { word = 'a' }, { word = 'b' } } })
+      feed('<C-e>')
+      eq(0, fn.pumvisible())
+      eq(-1, api.nvim__complete({ id = id, items = { { word = 'late' } } }))
+      eq(0, fn.pumvisible())
+
+      id = api.nvim__complete({ col = 1, items = { { word = 'a' } } })
+      feed('<Esc>')
+      -- late batch after leaving Insert mode: -1, not an error
+      eq(-1, api.nvim__complete({ id = id, items = {} }))
+
+      -- batch already in flight when the user dismisses
+      feed('i')
+      exec_lua([[
+        _G.late = 'pending'
+        local id = vim.api.nvim__complete({ col = 1, items = { { word = 'a' } } })
+        vim.defer_fn(function()
+          _G.late = vim.api.nvim__complete({ id = id, items = { { word = 'z' } } })
+        end, 30)
+      ]])
+      feed('<C-e>')
+      t.retry(nil, nil, function()
+        eq(-1, exec_lua('return _G.late'))
+      end)
+      eq(0, fn.pumvisible())
+    end)
+
+    -- REWRITTEN (was 'append keeps menu order and the selection'):
+    -- replace carries the selection by word, and drops it when the word is gone.
+    -- The old preselect sub-cases are intentionally omitted (preselect x noselect
+    -- is subtle -- add them after verifying selected() locally).
+    it('replace keeps the selection by word', function()
+      feed('i')
+      local id = api.nvim__complete({ col = 1, items = { { word = 'aa' }, { word = 'bb' } } })
+      feed('<C-n>') -- select 'aa'
+      eq(0, selected())
+
+      -- 'aa' survives the replace, so it stays selected at its new position
+      eq(id, api.nvim__complete({ id = id, items = { { word = 'cc' }, { word = 'aa' } } }))
+      eq({ 'cc', 'aa' }, menu_words())
+      eq(1, selected())
+
+      -- the selected word is gone from the new list -> selection is dropped
+      eq(id, api.nvim__complete({ id = id, items = { { word = 'dd' } } }))
+      eq({ 'dd' }, menu_words())
+      eq(-1, selected())
+    end)
+
+    it('col is 1-based like complete()', function()
+      command('set completeopt=menuone')
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'foo b' })
+      feed('A')
+      local id = api.nvim__complete({ col = 5, items = { { word = 'bar' } } })
+      ok(id > 0)
+      feed('<C-y>')
+      eq('foo bar', api.nvim_get_current_line())
+    end)
+
+    -- REWRITTEN (was 'append never rewrites text in a longest session'):
+    -- replace restores the buffer to the leader and does not rewrite it to the
+    -- new list. Mirrors the original test's first scenario (which passed): we
+    -- capture whatever 'longest' left in the buffer and assert it is unchanged
+    -- after the replace, rather than hard-coding longest's insertion behaviour.
+    it('replace restores the leader in a longest session', function()
+      command('set completeopt=menu,longest')
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'foo' })
+      feed('A')
+      local id = api.nvim__complete({ col = 1, items = { { word = 'foobar' }, { word = 'foobaz' } } })
+      -- A replaceable session keeps only the "nothing selected" half of
+      -- 'longest' (set_completion() clears compl_get_longest), so the leader
+      -- stays exactly what was typed -- it is not extended to a common prefix.
+      local leader = api.nvim_get_current_line()
+      eq('foo', leader)
+      -- replace restores exactly that leader, not the new list's text
+      eq(id, api.nvim__complete({ id = id, items = { { word = 'fizz' } } }))
+      eq(leader, api.nvim_get_current_line())
+    end)
+
+    it('reentrancy from autocmds during a call', function()
+      feed('i')
+      api.nvim__complete({ col = 1, items = { { word = 'old' } } })
+      exec_lua([[
+        vim.api.nvim_create_autocmd('CompleteDone', {
+          once = true,
+          callback = function() vim.fn.complete(1, { 'nested' }) end,
+        })
+      ]])
+      -- CompleteDone fires while the old session is torn down, before the
+      -- new list is installed, so the nested complete() gets clobbered
+      local id = api.nvim__complete({ col = 1, items = { { word = 'outer' } } })
+      ok(id > 0)
+      eq({ 'outer' }, menu_words())
+      eq(id, api.nvim__complete({ id = id, items = { { word = 'more' } } }))
+
+      exec_lua([[
+        _G.thief_err = 'unset'
+        vim.api.nvim_create_autocmd('ModeChanged', {
+          pattern = '*:ic',
+          once = true,
+          callback = function()
+            local ok_, e = pcall(vim.fn.complete, 1, { 'thief' })
+            _G.thief_err = ok_ and '' or tostring(e)
+          end,
+        })
+      ]])
+      -- ModeChanged fires after the list is installed and has no textlock
+      eq(-1, api.nvim__complete({ col = 1, items = { { word = 'outer2' } } }))
+      eq('', exec_lua('return _G.thief_err'))
+      eq({ 'thief' }, menu_words())
+
+      exec_lua([[
+        _G.cc = 'unset'
+        vim.api.nvim_create_autocmd('CompleteChanged', {
+          once = true,
+          callback = function()
+            local ok_, e = pcall(vim.api.nvim__complete, { col = 1, items = { { word = 'x' } } })
+            _G.cc = ok_ and 'allowed' or tostring(e)
+          end,
+        })
+      ]])
+      id = api.nvim__complete({ col = 1, items = { { word = 'a' } } })
+      ok(id > 0)
+      matches('E565', exec_lua('return _G.cc'))
+    end)
+
+    local function shown_words()
+      local words = {}
+      for _, item in ipairs(fn.complete_info({ 'matches' }).matches) do
+        table.insert(words, item.word)
+      end
+      return words
+    end
+
+    -- S7.  ins_compl_replace_list() edits the line at the compl_lnum/compl_col of
+    -- the window the session belongs to, so a batch that lands elsewhere is dropped.
+    it('rejects a batch aimed at another window', function()
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'hel' })
+      feed('A')
+      -- One RPC request is one K_EVENT, and insert.c cancels the session at the end
+      -- of the key that left the window.  Both steps have to happen in one call.
+      local res = exec_lua([[
+        local win = vim.api.nvim_get_current_win()
+        local id = vim.api.nvim__complete({ col = 1, items = { { word = 'hello' } } })
+        vim.api.nvim_set_current_win(vim.api.nvim_open_win(
+          vim.api.nvim_create_buf(false, true), false,
+          { relative = 'editor', row = 0, col = 0, width = 10, height = 3 }))
+        local r = {
+          id = id,
+          replace = vim.api.nvim__complete({ id = id, items = { { word = 'zzz' } } }),
+          start = vim.api.nvim__complete({ col = 1, items = { { word = 'zzz' } } }),
+        }
+        vim.api.nvim_set_current_win(win)
+        return r
+      ]])
+      ok(res.id > 0)
+      eq(-1, res.replace)
+      eq(-1, res.start)
+
+      feed('<Esc>')
+      eq({ 'hel' }, api.nvim_buf_get_lines(0, 0, -1, true))
+    end)
+
+    -- 1, and the same hazard in set_completion().  ins_compl_stop() used to be
+    -- handed a literal space, which a server can list among its commit characters.
+    it('does not accept a match when a space is a commit character', function()
+      command('set completeopt=menu,menuone')
+      exec_lua([[
+        _G.done = {}
+        vim.api.nvim_create_autocmd('CompleteDone', {
+          callback = function() table.insert(_G.done, vim.v.event.reason) end,
+        })
+      ]])
+      feed('i')
+      local win = api.nvim_get_current_win()
+      ok(api.nvim__complete({ col = 1, items = { { word = 'hello', commit_chars = ' ' } } }) > 0)
+      eq(1, fn.pumvisible())
+
+      -- Leaving the window cancels the completion.  Cancelling is not accepting.
+      api.nvim_set_current_win(api.nvim_open_win(api.nvim_create_buf(false, true), false, {
+        relative = 'editor',
+        row = 0,
+        col = 0,
+        width = 10,
+        height = 3,
+      }))
+      api.nvim_set_current_win(win)
+      feed('x')
+      eq({ 'discard' }, exec_lua('return _G.done'))
+    end)
+
+    -- S3-a.  'ignorecase' and 'smartcase' reach the filtering the engine redoes as
+    -- the leader grows.  Items carry icase=1, as vim.lsp.completion sets it.
+    describe("filtering as the leader grows honours 'ignorecase'", function()
+      local items = { { word = 'Foobar', icase = 1 }, { word = 'foobaz', icase = 1 } }
+
+      it('is case sensitive without it', function()
+        command('set noignorecase')
+        feed('if')
+        ok(api.nvim__complete({ col = 1, items = items }) > 0)
+        feed('oo')
+        eq({ 'foobaz' }, shown_words())
+      end)
+
+      it('is case insensitive with it', function()
+        command('set ignorecase')
+        feed('if')
+        ok(api.nvim__complete({ col = 1, items = items }) > 0)
+        feed('oo')
+        eq({ 'Foobar', 'foobaz' }, shown_words())
+      end)
+
+      it("is case sensitive with 'smartcase' and an uppercase leader", function()
+        command('set ignorecase smartcase')
+        feed('iF')
+        ok(api.nvim__complete({ col = 1, items = items }) > 0)
+        feed('oo')
+        eq({ 'Foobar' }, shown_words())
+      end)
+    end)
+
+    -- S1.  Without "noselect" the shown match is in the line; typing used to end the
+    -- session (firing CompleteDone) and the caller had to start a new one.
+    it('survives typing over an inserted match', function()
+      command('set completeopt=menu,menuone')
+      exec_lua([[
+        _G.done = {}
+        vim.api.nvim_create_autocmd('CompleteDone', {
+          callback = function() table.insert(_G.done, vim.v.event.reason) end,
+        })
+      ]])
+      feed('ih')
+      local id = api.nvim__complete({ col = 1, items = { { word = 'hello' }, { word = 'helper' } } })
+      ok(id > 0)
+      eq('hello', api.nvim_get_current_line())
+
+      feed('e')
+      -- The match came back out, the leader grew, and nothing ended.
+      eq('he', api.nvim_get_current_line())
+      eq({}, exec_lua('return _G.done'))
+      -- Same session: a replace on the original id still lands.
+      eq(id, api.nvim__complete({ id = id, items = { { word = 'held' }, { word = 'helm' } } }))
+      eq({ 'held', 'helm' }, menu_words())
+    end)
+
+    --- Three geometries in one list, against "p.mem" with col = 3, so compl_col
+    --- is 2 (0-indexed) and the leader is "mem".  Everything an item carries is
+    --- measured from its own column:
+    ---   member9   starts at compl_col
+    ---   ember2    starts one past it; its own leader is "em"
+    ---   ->member  reaches one in front of it; its own leader is ".mem"
+    local function mixed_items()
+      return {
+        { word = 'member9' },
+        { word = 'ember2', startcol = 4, filter_text = 'ember2' },
+        { word = '->member', startcol = 2, filter_text = '.member' },
+      }
+    end
+
+    it('browses a list whose items start at different columns', function()
+      feed('ip.mem')
+      exec_lua(function(items)
+        vim.o.completeopt = 'menu,menuone,noselect'
+        vim.api.nvim__complete({ col = 3, items = items })
+      end, mixed_items())
+
+      -- Each geometry writes its own, and none leaves a piece of another behind:
+      -- the text in front of an item's column is rebuilt from the leader.
+      feed('<C-n>')
+      eq('p.member9', api.nvim_get_current_line())
+      feed('<C-n>')
+      eq('p.member2', api.nvim_get_current_line())
+      feed('<C-n>')
+      eq('p.member', api.nvim_get_current_line())
+
+      feed('<C-p>')
+      eq('p.member2', api.nvim_get_current_line())
+      feed('<C-p>')
+      eq('p.member9', api.nvim_get_current_line())
+      feed('<C-y>')
+      eq('p.member9', api.nvim_get_current_line())
+    end)
+
+    it("browses mixed columns with 'fuzzy'", function()
+      feed('ip.mem')
+      exec_lua(function(items)
+        -- "nosort" so that the order is the one given: this is about what each
+        -- geometry writes, not about ranking.
+        vim.o.completeopt = 'menu,menuone,noselect,fuzzy,nosort'
+        vim.api.nvim__complete({ col = 3, items = items })
+      end, mixed_items())
+      -- The word need not begin with what the line holds, so a wrong rebuild shows
+      -- up as a spliced word rather than a missing character.
+      feed('<C-n><C-n>')
+      eq('p.member2', api.nvim_get_current_line())
+
+      -- Back to where the second item's own range starts: its pattern is then
+      -- empty, which matches everything, like the len-0 compare on the
+      -- non-fuzzy path.
+      feed('<BS><BS>')
+      eq(3, #fn.complete_info({ 'matches' }).matches)
+    end)
+
+    it("keeps the text in front of an item's column under 'preinsert'", function()
+      feed('ip.mem')
+      exec_lua(function(items)
+        vim.o.completeopt = 'menu,menuone,noselect,preinsert'
+        vim.api.nvim__complete({ col = 3, items = items })
+      end, mixed_items())
+      -- Nothing of the match is in the line, so accepting rebuilds all of it.
+      eq('p.mem', api.nvim_get_current_line())
+      feed('<C-n><C-n><C-y>')
+      eq('p.member2', api.nvim_get_current_line())
+    end)
+
+    it('ends the session when items are omitted', function()
+      feed('ifoo<Esc>o')
+      local id = exec_lua(function()
+        return vim.api.nvim__complete({ col = 1, items = { 'foobar', 'foobaz' } })
+      end)
+      assert(id > 0)
+      eq(1, fn.pumvisible())
+
+      eq(
+        id,
+        exec_lua(function(session)
+          return vim.api.nvim__complete({ id = session })
+        end, id)
+      )
+      eq(0, fn.pumvisible())
+      eq('', fn.complete_info({ 'mode' }).mode)
+
+      -- The id is spent.
+      eq(
+        -1,
+        exec_lua(function(session)
+          return vim.api.nvim__complete({ id = session })
+        end, id)
+      )
+    end)
+
+    it('reports "discard" for a session ended without a selection', function()
+      exec_lua(function()
+        vim.o.completeopt = 'menu,menuone,noselect'
+        _G.reasons = {}
+        vim.api.nvim_create_autocmd('CompleteDone', {
+          callback = function()
+            _G.reasons[#_G.reasons + 1] = vim.v.event.reason
+          end,
+        })
+      end)
+      feed('ifoo<Esc>o')
+      local id = exec_lua(function()
+        return vim.api.nvim__complete({ col = 1, items = { 'foobar' } })
+      end)
+      exec_lua(function(session)
+        vim.api.nvim__complete({ id = session })
+      end, id)
+      eq({ 'discard' }, exec_lua('return _G.reasons'))
+    end)
+
+    it('keeps the id when a CompleteChanged handler raises', function()
+      exec_lua(function()
+        vim.o.completeopt = 'menu,menuone,noselect'
+        vim.api.nvim_create_autocmd('CompleteChanged', {
+          callback = function()
+            error('handler blew up')
+          end,
+        })
+      end)
+      feed('ifoo<Esc>o')
+      -- The session is up, so the id has to reach the caller even though the
+      -- handler raised: nothing can look it up afterwards.
+      local id = api.nvim__complete({ col = 1, items = { { word = 'bar' } } })
+      ok(id > 0)
+      eq(id, api.nvim__complete({ id = id, items = { { word = 'baz' } } }))
+    end)
+
+    it("previews under 'preinsert' with 'ignorecase' and no 'infercase'", function()
+      -- The engine and vim._core.completion.preinsert both read the option, so
+      -- either both act or neither does: a session that holds the buffer at the
+      -- leader without anything drawing it would show a selection with no hint
+      -- of what accepting it inserts.
+      exec_lua(function()
+        vim.o.completeopt = 'menu,menuone,preinsert'
+        vim.o.autocomplete = true
+        vim.o.ignorecase = true
+        vim.o.infercase = false
+      end)
+      feed('ifoo<Esc>o')
+      local id = api.nvim__complete({ col = 1, items = { { word = 'foobar' } } })
+      ok(id > 0)
+      -- 'ignorecase' without 'infercase' turns the preview off, so the match is
+      -- written instead of held back.
+      eq('foobar', api.nvim_get_current_line())
+    end)
+
+    it('requires items to start a session', function()
+      feed('ifoo<Esc>o')
+      matches(
+        "'items' is required to start a session",
+        pcall_err(api.nvim__complete, { col = 1 })
+      )
+    end)
+  end)
 end)

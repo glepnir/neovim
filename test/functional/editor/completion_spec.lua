@@ -1933,3 +1933,115 @@ describe('completion', function()
     eq({ nil, nil, nil }, { items[4].equal, items[4].preselect, items[4].commit_chars })
   end)
 end)
+
+describe('vim._core.completion', function()
+  before_each(clear)
+
+  it('registers a completionProvider that matches every buffer', function()
+    -- No documentSelector: it matches on a glob of the file name, which an
+    -- unnamed buffer has none of.
+    eq(
+      { 1, true },
+      exec_lua(function()
+        local completion = require('vim._core.completion')
+        completion.enable(true, 0, { sources = { completion.source.files } })
+        local client = vim.lsp.get_clients({ name = 'nvim.completion' })[1]
+        return {
+          #(client:_get_registrations('completionProvider', 0) or {}),
+          client:supports_method('textDocument/completion', 0),
+        }
+      end)
+    )
+  end)
+
+  it('offers the characters of every buffer it was enabled for', function()
+    eq(
+      { '/' },
+      exec_lua(function()
+        local completion = require('vim._core.completion')
+        local other = vim.api.nvim_create_buf(true, false)
+        completion.enable(true, 0, { sources = { completion.source.keyword } })
+        completion.enable(true, other, { sources = { completion.source.files } })
+        local client = vim.lsp.get_clients({ name = 'nvim.completion' })[1]
+        local regs = client:_get_registrations('completionProvider', 0)
+        return regs[1].registerOptions.triggerCharacters
+      end)
+    )
+  end)
+
+  it('answers a trigger character with the buffer\'s own sources', function()
+    -- The two builtin gates are complementary, so a path goes to one of them
+    -- and a word to the other; a buffer with only "keyword" answers neither.
+    eq(
+      { isIncomplete = false, items = {} },
+      exec_lua(function()
+        local completion = require('vim._core.completion')
+        completion.enable(true, 0, { sources = { completion.source.keyword } })
+        -- A directory the test makes, not one the cwd happens to have.
+        local dir = vim.fs.joinpath(vim.fn.tempname(), 'sub')
+        vim.fn.mkdir(dir, 'p')
+        vim.api.nvim_set_current_dir(vim.fs.dirname(dir))
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'sub/' })
+        vim.api.nvim_win_set_cursor(0, { 1, 4 })
+        return vim.async
+          .run(function()
+            return completion._do_complete({
+              textDocument = { uri = vim.uri_from_bufnr(0) },
+              position = { line = 0, character = 4 },
+              context = { triggerKind = 2, triggerCharacter = '/' },
+            })
+          end)
+          :wait(1000)
+      end)
+    )
+  end)
+
+  it('requires sources', function()
+    eq(
+      false,
+      exec_lua(function()
+        return pcall(require('vim._core.completion').enable, true, 0, {})
+      end)
+    )
+  end)
+
+  it('forgets a buffer that is wiped out', function()
+    eq(
+      0,
+      exec_lua(function()
+        local completion = require('vim._core.completion')
+        local buf = vim.api.nvim_create_buf(true, false)
+        completion.enable(true, buf, { sources = { completion.source.keyword } })
+        vim.api.nvim_buf_delete(buf, { force = true })
+        return #completion.get_sources(buf)
+      end)
+    )
+  end)
+
+  it('replaces the sources a previous call gave', function()
+    eq(
+      { 'files' },
+      exec_lua(function()
+        local completion = require('vim._core.completion')
+        completion.enable(true, 0, { sources = { completion.source.keyword } })
+        completion.enable(true, 0, { sources = { completion.source.files } })
+        return vim.tbl_map(function(s)
+          return s.name
+        end, completion.get_sources(0))
+      end)
+    )
+  end)
+
+  it('keeps only the last source of a name', function()
+    eq(
+      1,
+      exec_lua(function()
+        local completion = require('vim._core.completion')
+        completion.enable(true, 0, {
+          sources = { completion.source.keyword, completion.source.keyword },
+        })
+        return #completion.get_sources(0)
+      end)
+    )
+  end)
+end)

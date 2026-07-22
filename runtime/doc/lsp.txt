@@ -2262,6 +2262,17 @@ inserts the character. To disable this: >lua
 <
 
 
+*vim.lsp.completion.Prepared*
+
+    Fields: ~
+      • {filter}  (`string`) what it is filtered by, spanning what it replaces
+      • {item}    (`lsp.CompletionItem`)
+      • {prefix}  (`string`) line text from that column to the cursor
+      • {start}   (`integer?`) 0-indexed column it replaces from, when it has
+                  one
+      • {word}    (`string`) what accepting it inserts
+
+
                                                  *vim.lsp.completion.enable()*
 enable({enable}, {client_id}, {bufnr}, {opts})
     Enables or disables completions from the given language client in the
@@ -2286,6 +2297,13 @@ enable({enable}, {client_id}, {bufnr}, {opts})
       • Behavior of `autotrigger=true` is controlled by the LSP
         `triggerCharacters` field. You can override it on LspAttach, see
         |lsp-autocompletion|.
+      • `autotrigger` and `identifier` are per client; the rest of {opts} is
+        the buffer's, and a field omitted keeps the value a previous call gave
+        it.
+      • A trigger character is served even with the menu up, since it opens a
+        context the menu cannot filter its way into.
+        |vim.lsp.completion.get()| is not: what is on screen is filtered
+        locally.
 
     Parameters: ~
       • {enable}     (`boolean`) True to enable, false to disable
@@ -2301,6 +2319,21 @@ enable({enable}, {client_id}, {bufnr}, {opts})
                        false, commit characters are ignored.
                      • {convert}? (`fun(item: lsp.CompletionItem): table`)
                        Transforms an LSP CompletionItem to |complete-items|.
+                     • {identifier}? (`boolean`) (default: false) When true,
+                       completion also triggers while an identifier is being
+                       typed, which the LSP specification leaves to the
+                       client.
+                     • {insert_mode}? (`'insert'|'replace'`) (default:
+                       "insert") How much of an |lsp.InsertReplaceEdit| is
+                       replaced: up to the cursor, or its whole replace range.
+                     • {rank}? (`integer`) Where this client's items go when
+                       the match scores do not separate them, lower first;
+                       clients without one come last. Omitting it keeps what a
+                       previous call set.
+                     • {secondary}? (`boolean`) When true, an item of this
+                       client's is dropped if another client already offered
+                       the same word. Omitting it keeps what a previous call
+                       set.
 
 get({opts})                                         *vim.lsp.completion.get()*
     Triggers LSP completion once in the current buffer, if LSP completion is
@@ -2320,6 +2353,9 @@ get({opts})                                         *vim.lsp.completion.get()*
       • {opts}  (`table?`) A table with the following fields:
                 • {ctx}? (`lsp.CompletionContext`) Completion context.
                   Defaults to a trigger kind of `invoked`.
+                • {filter}? (`fun(client: vim.lsp.Client): boolean`) Only
+                  request from enabled clients this returns true for. Defaults
+                  to all of them.
 
 
 ==============================================================================

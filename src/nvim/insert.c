@@ -589,8 +589,10 @@ static int insert_execute(VimState *state, int key)
       return 1;  // continue
     }
 
-    // When no match was selected or it was edited.
-    if (!ins_compl_used_match()) {
+    // When no match was selected or it was edited.  A replaceable session goes
+    // on being filtered too: its caller answers the next leader with new
+    // matches, so the key extends it rather than ending it.
+    if (!ins_compl_used_match() || ins_compl_replaceable_session()) {
       // CTRL-L: Add one character from the current match to
       // "compl_leader".  Except when at the original match and
       // there is nothing to add, CTRL-L works like CTRL-P then.
@@ -625,15 +627,19 @@ static int insert_execute(VimState *state, int key)
            || (ins_compl_enter_selects()
                && (s->c == CAR || s->c == K_KENTER || s->c == NL)))
           && stop_arrow() == OK) {
-        ins_compl_delete(false);
-        if (ins_compl_preinsert_longest() && !ins_compl_is_match_selected()) {
-          ins_compl_insert(false, true);
+        if (ins_compl_autocompl_longest() && !ins_compl_is_match_selected()) {
+          ins_compl_delete(false);
+          ins_compl_insert(false, true, false);
           ins_compl_init_get_longest();
           return 1;  // continue
-        } else {
-          ins_compl_insert(false, false);
+        } else if (!ins_compl_stop_writes_match()) {
+          // Only when nobody else will: ins_compl_stop() applies the range of a
+          // match reaching in front of the word itself, and writing it here too
+          // would hand on_bytes the same edit twice.
+          ins_compl_delete(false);
+          ins_compl_insert(false, false, false);
         }
-      } else if (ascii_iswhite_nl_or_nul(s->c) && ins_compl_preinsert_effect()) {
+      } else if (ascii_iswhite_nl_or_nul(s->c) && ins_compl_autocompl_longest_shown()) {
         // Delete preinserted text when typing special chars
         ins_compl_delete(false);
       }

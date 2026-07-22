@@ -1267,11 +1267,39 @@ items:
 			usual.  Takes precedence over extending the leader.
 			Only while the popup menu is displayed.  Control
 			characters (below 0x20) are ignored.
+	startcol	The column this item replaces from, as a byte index
+			starting at 1.  Without it the item starts where
+			|complete()| was told to, which is only where the
+			popup menu is anchored: an item may start on either
+			side of it.
 
-All of these except "icase", "equal", "dup" and "empty" must be a string.  If
-an item does not meet these requirements then an error message is given and
-further items in the list are not used.  You can mix string and Dictionary
-items in the returned list.
+			The item is dropped when "startcol" is not a byte
+			index into the line, is past the cursor, does not
+			land on a character boundary, or when it reaches in
+			front of the completion and "filter_text" does not
+			begin with the text it covers.
+
+			An item reaching in front of the completion is shown
+			as its "filter_text" while it is browsed, since that
+			is what the line has to hold for the filtering to
+			mean anything.  Its range is applied only by CTRL-Y,
+			a commit character, or CR while `enter_selects` is
+			on; any other way of ending the completion puts the
+			typed text back, as CTRL-E does.
+
+			The item is also dropped while 'completeopt'
+			contains "longest", which shortens the leader
+			before a per-item column is read.
+	filter_text	Text this item is filtered by.  Defaults to "word".
+			Giving both lets an item be found by one text and
+			insert another.  An item that also has "startcol"
+			is shown as this while it is browsed, since the
+			line has to hold what the filtering is against.
+
+All of these except "icase", "equal", "dup", "empty" and "startcol" must be a
+string.  If an item does not meet these requirements then an error message is
+given and further items in the list are not used.  You can mix string and
+Dictionary items in the returned list.
 
 The "menu" item is used in the popup menu and may be truncated, thus it should
 be relatively short.  The "info" item can be longer, it will  be displayed in
