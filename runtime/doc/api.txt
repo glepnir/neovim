@@ -1739,6 +1739,31 @@ nvim__cmdwin_set({type}, {buf})                           *nvim__cmdwin_set()*
       • {type}  (`string`) ':', '/', '?' (first char only); empty to clear.
       • {buf}   (`integer`) cmdwin buffer id, or 0 to clear.
 
+nvim__complete({opts})                                      *nvim__complete()*
+    WARNING: This feature is experimental/unstable.
+
+    Sets Insert-mode completion candidates like |complete()|, or replaces the
+    candidates of a running session.
+
+    Omit `id` to start a session and get its id; pass it back to replace that
+    session's candidates, keeping the typed prefix and the selection.
+
+    Attributes: ~
+        Since: 0.13.0
+
+    Parameters: ~
+      • {opts}  (`vim.api.keyset.complete_set?`) Dict:
+                • col: (integer) 1-based byte column where completion starts,
+                  as in |complete()|. Required to start a session, otherwise
+                  ignored.
+                • id: (integer) Id from a previous call; omit to start one.
+                • items: (array) Candidates, see |complete-items|.
+
+    Return: ~
+        (`integer`) Session id (> 0), or -1 when nothing was installed: `id`
+        is stale, Insert mode ended, the text is locked, or the column no
+        longer names the start of a character.
+
 nvim__complete_set({index}, {opts})                     *nvim__complete_set()*
     WARNING: This feature is experimental/unstable.
 

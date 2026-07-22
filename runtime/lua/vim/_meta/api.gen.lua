@@ -34,6 +34,25 @@ function vim.api.nvim__cmdwin_set(type, buf) end
 
 --- WARNING: This feature is experimental/unstable.
 ---
+--- Sets Insert-mode completion candidates like `complete()`, or replaces the
+--- candidates of a running session.
+---
+--- Omit `id` to start a session and get its id; pass it back to replace that
+--- session's candidates, keeping the typed prefix and the selection.
+---
+--- @param opts vim.api.keyset.complete_set? Dict:
+--- - col: (integer) 1-based byte column where completion starts,
+---   as in `complete()`. Required to start a session, otherwise
+---   ignored.
+--- - id: (integer) Id from a previous call; omit to start one.
+--- - items: (array) Candidates, see `complete-items`.
+--- @return integer # Session id (> 0), or -1 when nothing was installed: `id` is stale,
+--- Insert mode ended, the text is locked, or the column no longer
+--- names the start of a character.
+function vim.api.nvim__complete(opts) end
+
+--- WARNING: This feature is experimental/unstable.
+---
 --- Sets info for the completion item at the given index. If the info text was shown in a window,
 --- returns the window and buffer ids, or empty dict if not shown.
 ---

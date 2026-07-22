@@ -86,6 +86,7 @@
 #include "nvim/terminal.h"
 #include "nvim/types_defs.h"
 #include "nvim/ui.h"
+#include "nvim/undo.h"
 #include "nvim/vim_defs.h"
 #include "nvim/window.h"
 
@@ -2602,4 +2603,73 @@ void nvim__redraw(Dict(redraw) *opts, Error *err)
 void nvim__set_restart_on_crash(String progpath, Array argv)
 {
   ui_call__set_restart_on_crash_exit(progpath, argv);
+}
+
+/// Sets Insert-mode completion candidates like |complete()|, or replaces the
+/// candidates of a running session.
+///
+/// Omit `id` to start a session and get its id; pass it back to replace that
+/// session's candidates, keeping the typed prefix and the selection.
+///
+/// @param opts  Dict:
+///              - col: (integer) 1-based byte column where completion starts,
+///                as in |complete()|. Required to start a session, otherwise
+///                ignored.
+///              - id: (integer) Id from a previous call; omit to start one.
+///              - items: (array) Candidates, see |complete-items|.
+/// @param[out] err  Error details, if any.
+/// @return  Session id (> 0), or -1 when nothing was installed: `id` is stale,
+///          Insert mode ended, the text is locked, or the column no longer
+///          names the start of a character.
+Integer nvim__complete(Dict(complete_set) *opts, Error *err)
+  FUNC_API_SINCE(15)
+{
+  if (!HAS_KEY(opts, complete_set, items)) {
+    api_set_error(err, kErrorTypeValidation, "'items' is required");
+    return -1;
+  }
+
+  int64_t id = HAS_KEY(opts, complete_set, id) ? opts->id : 0;
+  VALIDATE(id >= 0, "Invalid 'id': %" PRId64, id, {
+    return -1;
+  });
+
+  if (id == 0) {
+    if ((State & MODE_INSERT) == 0) {
+      api_set_error(err, kErrorTypeException, "Insert mode required");
+      return -1;
+    }
+    VALIDATE(HAS_KEY(opts, complete_set, col)
+             && opts->col >= 1 && opts->col <= INT_MAX, "%s",
+             "'col' is required to start a session and must be a valid column", {
+      return -1;
+    });
+  } else if ((State & MODE_INSERT) == 0 || textlock != 0) {
+    return -1;
+  }
+
+  typval_T items_tv;
+  object_to_vim(ARRAY_OBJ(opts->items), &items_tv, err);
+  if (ERROR_SET(err)) {
+    tv_clear(&items_tv);
+    return -1;
+  }
+
+  Integer ret = -1;
+  TRY_WRAP(err, {
+    if (undo_allowed(curbuf)) {
+      ret = id == 0
+            ? ins_compl_start_session((colnr_T)opts->col, items_tv.vval.v_list)
+            : ins_compl_replace_list(items_tv.vval.v_list, id);
+    }
+  });
+  tv_clear(&items_tv);
+  if (ret > 0) {
+    // The session is up and the caller needs its id: reporting an error instead
+    // would leave it running with nobody holding a handle to it.  This also
+    // swallows what a CompleteChanged handler raised, which fires from here.
+    api_clear_error(err);
+    return ret;
+  }
+  return ERROR_SET(err) ? -1 : ret;
 }

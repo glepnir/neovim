@@ -430,6 +430,9 @@ typedef struct {
 typedef struct {
   OptionalKeys is_set__complete_set_;
   String info;
+  Integer col;
+  Array items;
+  Integer id;
 } Dict(complete_set);
 
 typedef struct {

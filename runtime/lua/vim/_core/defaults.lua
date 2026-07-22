@@ -1153,3 +1153,7 @@ do
     vim.o.grepformat = '%f:%l:%c:%m'
   end
 end
+
+do
+  require('vim._core.completion')
+end

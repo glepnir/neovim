@@ -71,7 +71,10 @@ error('Cannot require a meta file')
 --- @field output? boolean
 
 --- @class vim.api.keyset.complete_set
+--- @field col? integer
+--- @field id? integer
 --- @field info? string
+--- @field items? any[]
 
 --- @class vim.api.keyset.context
 --- @field types? string[]

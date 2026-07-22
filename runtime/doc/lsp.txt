@@ -2301,6 +2301,9 @@ enable({enable}, {client_id}, {bufnr}, {opts})
                        false, commit characters are ignored.
                      • {convert}? (`fun(item: lsp.CompletionItem): table`)
                        Transforms an LSP CompletionItem to |complete-items|.
+                     • {insert_mode}? (`'insert'|'replace'`) (default:
+                       "insert") How much of an |lsp.InsertReplaceEdit| is
+                       replaced: up to the cursor, or its whole replace range.
 
 get({opts})                                         *vim.lsp.completion.get()*
     Triggers LSP completion once in the current buffer, if LSP completion is
@@ -2320,6 +2323,9 @@ get({opts})                                         *vim.lsp.completion.get()*
       • {opts}  (`table?`) A table with the following fields:
                 • {ctx}? (`lsp.CompletionContext`) Completion context.
                   Defaults to a trigger kind of `invoked`.
+                • {filter}? (`fun(client: vim.lsp.Client): boolean`) Only
+                  request from enabled clients this returns true for. Defaults
+                  to all of them.
 
 
 ==============================================================================

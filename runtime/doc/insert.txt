@@ -1265,6 +1265,26 @@ items:
 			usual.  Takes precedence over extending the leader.
 			Only while the popup menu is displayed.  Control
 			characters (below 0x20) are ignored.
+	startcol	The column the item replaces from, as a
+			byte index starting at 1.  Only for an
+			item that reaches in front of the word
+			being completed; without it the item
+			starts where |complete()| was told to.
+
+			The item is dropped when "startcol" is
+			not a byte index into the line, is past
+			that column, does not land on a
+			character boundary, or when
+			"filter_text" does not begin with the
+			text between the two columns.
+
+			Ignored, together with "filter_text",
+			while 'completeopt' contains "longest".
+	filter_text	Text this item is filtered by.  Defaults to
+			"word".  Giving both lets an item be found by
+			one text and insert another.
+			Ignored, together with "startcol",
+			while 'completeopt' contains "longest".
 
 All of these except "icase", "equal", "dup" and "empty" must be a string.  If
 an item does not meet these requirements then an error message is given and
