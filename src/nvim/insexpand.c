@@ -180,7 +180,6 @@ struct compl_S {
   int cp_user_abbr_hlattr;       ///< highlight attribute for abbr
   int cp_user_kind_hlattr;       ///< highlight attribute for kind
   int cp_cpt_source_idx;         ///< index of this match's source in 'cpt' option
-  int cp_startcol;               ///< column this replaces from, -1 for compl_col
   String cp_filter_str;          ///< text to filter by; NULL data = filter by cp_str
 };
 
@@ -1089,7 +1088,6 @@ static int ins_compl_add(char *const str, int len, char *const fname, char *cons
     match->cp_fname = NULL;
   }
   match->cp_flags = flags;
-  match->cp_startcol = -1;  // ins_compl_add_tv() sets it when the item has one
   match->cp_user_abbr_hlattr = user_hl ? user_hl[0] : -1;
   match->cp_user_kind_hlattr = user_hl ? user_hl[1] : -1;
   match->cp_score = score;
@@ -1170,13 +1168,6 @@ static int ins_compl_add(char *const str, int len, char *const fname, char *cons
   }
 
   return OK;
-}
-
-/// Whether "match" replaces text in front of the word.
-static bool ins_compl_reaches_back(compl_T *match)
-  FUNC_ATTR_PURE
-{
-  return match != NULL && match->cp_startcol >= 0 && match->cp_startcol < (int)compl_col;
 }
 
 /// Returns the text "match" is filtered by.
@@ -1470,6 +1461,17 @@ static bool ins_compl_pum_shows(void)
   return pum_wanted() && pum_enough_matches();
 }
 
+/// The column a match replaces from, -1 when it has none.  A 'cpt' F{func}
+/// source keeps it on the source, which does not survive complete().
+static int compl_effective_startcol(compl_T *match)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (cpt_sources_array != NULL && match->cp_cpt_source_idx >= 0) {
+    return cpt_sources_array[match->cp_cpt_source_idx].cs_startcol;
+  }
+  return -1;
+}
+
 /// Convert to complete item dict
 static dict_T *ins_compl_dict_alloc(compl_T *match)
 {
@@ -1485,8 +1487,9 @@ static dict_T *ins_compl_dict_alloc(compl_T *match)
   } else {
     tv_dict_add_tv(dict, S_LEN("user_data"), &match->cp_user_data);
   }
-  if (match->cp_startcol >= 0) {
-    tv_dict_add_nr(dict, S_LEN("startcol"), match->cp_startcol + 1);
+  int startcol = compl_effective_startcol(match);
+  if (startcol >= 0) {
+    tv_dict_add_nr(dict, S_LEN("startcol"), startcol + 1);
   }
   if (match->cp_filter_str.data != NULL) {
     tv_dict_add_str(dict, S_LEN("filter_text"), match->cp_filter_str.data);
@@ -1598,39 +1601,6 @@ static String *get_leader_for_startcol(compl_T *match, bool cached)
   // 'autocomplete' fires once before compl_leader is set.
   String *base = compl_leader.data != NULL ? &compl_leader : &compl_orig_text;
 
-  // A match that reaches back is filtered by what it replaces too.
-  if (match->cp_startcol >= 0) {
-    if (match->cp_startcol >= (int)compl_col) {
-      return base;
-    }
-    if (compl_leader.data == NULL) {
-      // Nothing typed yet, and compl_orig_text describes the word rather than
-      // what this match reaches back over.  A NULL string is "no prefix
-      // filter"; what it replaces was checked by ins_compl_add_tv().
-      return &compl_leader;
-    }
-    const size_t prepend = (size_t)(compl_col - match->cp_startcol);
-    const String filter = ins_compl_filter_str(match);
-    if (filter.size < prepend) {
-      return base;
-    }
-    // From the filter text, which ins_compl_add_tv() checked against the line,
-    // rather than from the line, which holds the match itself by now.
-    const size_t new_length = prepend + compl_leader.size;
-    // Keyed on the length alone: compl_col and compl_leader hold still within one
-    // pass, and matches reaching equally far back replaced the same text.
-    if (cached && new_length == adjusted_leader.size && adjusted_leader.data != NULL) {
-      return &adjusted_leader;
-    }
-    API_CLEAR_STRING(adjusted_leader);
-    adjusted_leader.data = xmalloc(new_length + 1);
-    memcpy(adjusted_leader.data, filter.data, prepend);
-    memcpy(adjusted_leader.data + prepend, compl_leader.data, compl_leader.size);
-    adjusted_leader.data[new_length] = NUL;
-    adjusted_leader.size = new_length;
-    return &adjusted_leader;
-  }
-
   // A 'cpt' F{func} source keeps the column on the source.  Its matches start
   // with that text rather than replacing it, so the line still holds it.
   if (cpt_sources_array == NULL || match->cp_cpt_source_idx < 0) {
@@ -1662,25 +1632,17 @@ static void set_fuzzy_score(void)
     return;
   }
 
-  // Determine the pattern to match against
-  bool use_leader = (compl_leader.data != NULL && compl_leader.size > 0);
-  char *pattern;
-  if (!use_leader) {
-    if (compl_orig_text.data == NULL || compl_orig_text.size == 0) {
-      return;
-    }
-    pattern = compl_orig_text.data;
-  } else {
-    // Clear the leader cache once before the loop
-    (void)get_leader_for_startcol(NULL, true);
-    pattern = NULL;  // Will be computed per-completion
-  }
+  (void)get_leader_for_startcol(NULL, true);  // Clear the cache
 
-  // Score all completion matches
+  // Against the text each match is filtered by, so that one reaching in front
+  // of the word is scored on that text too.
   compl_T *comp = compl_first_match;
   do {
-    if (use_leader) {
-      pattern = get_leader_for_startcol(comp, true)->data;
+    String *leader = get_leader_for_startcol(comp, true);
+    char *pattern = leader->data != NULL ? leader->data : compl_orig_text.data;
+    if (pattern == NULL || *pattern == NUL) {
+      comp = comp->cp_next;
+      continue;
     }
 
     comp->cp_score = fuzzy_match_str(ins_compl_filter_str(comp).data, pattern);
@@ -2554,8 +2516,12 @@ static void ins_compl_restore_typed_text(void)
     // still in the line.  Reading the leader past its end would be wrong.
     return;
   }
-  if (compl_leader.data != NULL) {
-    ins_compl_insert_bytes(compl_leader.data + len, -1);
+  // Through the accessor: before the first keystroke compl_leader is NULL and
+  // what the line held is compl_orig_text, which the delete above took out with
+  // the match.
+  char *const leader = ins_compl_leader();
+  if (leader != NULL) {
+    ins_compl_insert_bytes(leader + len, -1);
   }
   compl_used_match = false;
 }
@@ -2611,7 +2577,7 @@ static void ins_compl_new_leader(void)
     compl_enter_selects = false;
   } else if (compl_started && ins_compl_preinsert_longest()
              && compl_leader.size > 0 && !ins_compl_preinsert_effect()) {
-    ins_compl_insert(true, true, false);
+    ins_compl_insert(true, true);
   }
   // Don't let Enter select when use user function and refresh_always is set
   if (ins_compl_refresh_always()) {
@@ -2700,29 +2666,15 @@ static void ins_compl_set_original_text(char *str, size_t len)
   }
 }
 
-/// Returns what "match" contributes to the leader, from compl_col on: its filter
-/// text past what it replaces when it reaches back, else what it inserts.
-static String ins_compl_leader_text(compl_T *match)
-  FUNC_ATTR_NONNULL_ALL
-{
-  if (!ins_compl_reaches_back(match)) {
-    return match->cp_str;
-  }
-  String filter = ins_compl_filter_str(match);
-  size_t skip = (size_t)(compl_col - match->cp_startcol);
-  if (filter.size < skip) {
-    return match->cp_str;
-  }
-  return (String){ .data = filter.data + skip, .size = filter.size - skip };
-}
-
 /// Append one character to the match leader.  May reduce the number of
 /// matches.
 void ins_compl_addfrommatch(void)
 {
   int len = (int)curwin->w_cursor.col - (int)compl_col;
   assert(compl_shown_match != NULL);
-  String shown = ins_compl_leader_text(compl_shown_match);
+  // What it is filtered by, not what it inserts: a match that replaces text in
+  // front of the word inserts something the leader never had ("->member").
+  String shown = ins_compl_filter_str(compl_shown_match);
   char *p = shown.data;
   if ((int)shown.size <= len) {   // the match is too short
     // When still at the original match use the first entry that matches
@@ -2735,9 +2687,9 @@ void ins_compl_addfrommatch(void)
     size_t plen = 0;
     for (compl_T *cp = compl_shown_match->cp_next; cp != NULL
          && !is_first_match(cp); cp = cp->cp_next) {
-      if (compl_leader.data == NULL
-          || ins_compl_equal(cp, compl_leader.data, compl_leader.size)) {
-        String text = ins_compl_leader_text(cp);
+      String *leader = get_leader_for_startcol(cp, true);
+      if (leader->data == NULL || ins_compl_equal(cp, leader->data, leader->size)) {
+        String text = ins_compl_filter_str(cp);
         p = text.data;
         plen = text.size;
         break;
@@ -2889,16 +2841,6 @@ static bool ins_compl_stop(const int c, const int prev_mode, bool retval)
     ins_compl_delete(false);
   }
 
-  // The line holds the text the match is filtered by, so its edit is owed.
-  // CTRL-Y and a commit character go through insert.c, which applied it.
-  if (ins_compl_reaches_back(compl_shown_match) && compl_used_match && c != Ctrl_E
-      && ins_compl_win_active(curwin)
-      && curwin->w_cursor.lnum == compl_lnum && curwin->w_cursor.col >= compl_col
-      && stop_arrow() == OK) {
-    ins_compl_delete(false);
-    ins_compl_insert(false, false, true);
-  }
-
   // Get here when we have finished typing a sequence of ^N and
   // ^P or other completion characters in CTRL-X mode.  Free up
   // memory that was used, and make sure we can redo the insert.
@@ -2909,13 +2851,11 @@ static bool ins_compl_stop(const int c, const int prev_mode, bool retval)
     // of the original text that has changed.
     // When using the longest match, edited the match or used
     // CTRL-E then don't use the current match.
-    // compl_shown_match, the one written above: only ins_compl_show_pum() keeps
-    // compl_curr_match on it, and a session without a menu never runs it.
     char *ptr = NULL;
-    if (compl_shown_match != NULL && compl_used_match && c != Ctrl_E) {
-      ptr = compl_shown_match->cp_str.data;
+    if (compl_curr_match != NULL && compl_used_match && c != Ctrl_E) {
+      ptr = compl_curr_match->cp_str.data;
     }
-    ins_compl_fixRedoBufForLeader(ptr, compl_shown_match);
+    ins_compl_fixRedoBufForLeader(ptr);
   }
 
   bool want_cindent = (get_can_cindent() && cindent_on());
@@ -2955,7 +2895,7 @@ static bool ins_compl_stop(const int c, const int prev_mode, bool retval)
   // Note: Unlike Ctrl_Y, a commit-char accepts the match but does not consume the key.
   if ((c == Ctrl_Y || is_commit || (compl_enter_selects
                                     && (c == CAR || c == K_KENTER || c == NL)))
-      && pum_visible() && compl_shown_match != NULL) {
+      && pum_visible() && compl_shown_match != NULL && !compl_stopping_to_replace) {
     word = copy_string(compl_shown_match->cp_str, NULL);
     if (!is_commit) {
       retval = true;
@@ -2968,11 +2908,11 @@ static bool ins_compl_stop(const int c, const int prev_mode, bool retval)
   // (eg: only one match with 'completeopt' "menu" without "menuone"),
   // the user had no opportunity to explicitly accept or dismiss it,
   // so treat this as an implicit accept (#38160).
-  if (word.data == NULL && c != Ctrl_E
+  if (word.data == NULL && c != Ctrl_E && !compl_stopping_to_replace
       && compl_used_match && compl_match_array == NULL
-      && compl_shown_match != NULL
-      && compl_shown_match->cp_str.data != NULL) {
-    word = copy_string(compl_shown_match->cp_str, NULL);
+      && compl_curr_match != NULL
+      && compl_curr_match->cp_str.data != NULL) {
+    word = copy_string(compl_curr_match->cp_str, NULL);
   }
 
   // CTRL-E means completion is Ended, go back to the typed text.
@@ -3147,26 +3087,9 @@ bool ins_compl_prep(int c)
 
 /// Fix the redo buffer for the completion leader replacing some of the typed
 /// text.  This inserts backspaces and appends the changed text.
-/// "ptr" is the known leader text or NUL, "match" the one it came from.
-static void ins_compl_fixRedoBufForLeader(char *ptr_arg, compl_T *match)
+/// "ptr" is the known leader text or NUL.
+static void ins_compl_fixRedoBufForLeader(char *ptr_arg)
 {
-  // The match removed text outside compl_orig_text; back up over both.  From the
-  // filter text, since the line holds the match by now.
-  if (ptr_arg != NULL && ins_compl_reaches_back(match)) {
-    if (compl_orig_text.data != NULL) {
-      for (char *p = compl_orig_text.data; *p != NUL; MB_PTR_ADV(p)) {
-        AppendCharToRedobuff(K_BS);
-      }
-    }
-    String filter = ins_compl_filter_str(match);
-    const char *end = filter.data + (compl_col - match->cp_startcol);
-    for (const char *p = filter.data; p < end; MB_PTR_ADV(p)) {
-      AppendCharToRedobuff(K_BS);
-    }
-    AppendToRedobuffLit(ptr_arg, -1);
-    return;
-  }
-
   int len = 0;
   char *ptr = ptr_arg;
 
@@ -3568,42 +3491,18 @@ static int ins_compl_add_tv(typval_T *const tv, const Direction dir, bool fast)
     xfree(commit_chars);
     return FAIL;
   }
-  int startcol = -1;
   const char *filter_text = NULL;
   if (tv->v_type == VAR_DICT && tv->vval.v_dict != NULL) {
-    startcol = (int)tv_dict_get_number(tv->vval.v_dict, "startcol") - 1;
     filter_text = tv_dict_get_string(tv->vval.v_dict, "filter_text", false);
   }
   if (compl_get_longest) {
-    // 'longest' runs inside ins_compl_add() below, before these are set.
-    startcol = -1;
+    // 'longest' runs inside ins_compl_add() below, before this is set.
     filter_text = NULL;
-  }
-  if (startcol >= 0 && (compl_lnum <= 0 || compl_lnum > curbuf->b_ml.ml_line_count)) {
-    // complete_add() can be called outside a completion, with no such line.
-    startcol = -1;
-  }
-  if (startcol >= 0) {
-    const char *line = ml_get(compl_lnum);
-    const char *filter = filter_text != NULL ? filter_text : word;
-    size_t skip = startcol < (int)compl_col ? (size_t)(compl_col - startcol) : 0;
-    // Drop the item rather than its column: at compl_col its word would land on
-    // the text it meant to replace.
-    if (startcol > (int)compl_col || startcol > ml_get_len(compl_lnum)
-        || utf_head_off(line, line + startcol) != 0
-        || (skip > 0
-            && (strlen(filter) < skip || strncmp(filter, line + startcol, skip) != 0))) {
-      free_cptext(cptext);
-      tv_clear(&user_data);
-      xfree(commit_chars);
-      return FAIL;
-    }
   }
   int status = ins_compl_add((char *)word, -1, NULL, cptext, true,
                              &user_data, dir, flags, dup, user_hl, FUZZY_SCORE_NONE, preselect,
                              commit_chars);
   if (status == OK) {
-    compl_curr_match->cp_startcol = startcol;
     if (filter_text != NULL && *filter_text != NUL) {
       compl_curr_match->cp_filter_str = cbuf_to_string(filter_text, strlen(filter_text));
     }
@@ -3881,8 +3780,9 @@ static void fill_complete_info_dict(dict_T *di, compl_T *match, bool add_match)
   if (add_match) {
     tv_dict_add_bool(di, S_LEN("match"), match->cp_in_match_array);
   }
-  if (match->cp_startcol >= 0) {
-    tv_dict_add_nr(di, S_LEN("startcol"), match->cp_startcol + 1);
+  int startcol = compl_effective_startcol(match);
+  if (startcol >= 0) {
+    tv_dict_add_nr(di, S_LEN("startcol"), startcol + 1);
   }
   // "dup" and "empty" are arguments to ins_compl_add(), not properties of a
   // match.  "icase" is one, but ins_compl_build_pum() clears it in place per
@@ -5265,6 +5165,16 @@ void ins_compl_delete(bool new_leader)
       orig += utf_ptr2len(orig);
     }
     orig_col = (int)(orig - compl_orig_text.data);
+
+    // What is kept has to be what the line holds.  A match replacing text in
+    // front of the word put something else there ("->member" for ".mem"), and
+    // keeping bytes of that leaves half of it behind.
+    if (orig_col > 0 && compl_used_match && compl_shown_match != NULL
+        && (compl_shown_match->cp_str.size < (size_t)orig_col
+            || strncmp(compl_shown_match->cp_str.data, compl_orig_text.data,
+                       (size_t)orig_col) != 0)) {
+      orig_col = 0;
+    }
   }
 
   // In insert mode: Delete the typed part.
@@ -5460,23 +5370,18 @@ static char *find_common_prefix(size_t *prefix_len, bool curbuf_only)
 /// cursor needs to move back from the inserted text to the compl_leader.
 /// When "insert_prefix" is true the longest common prefix is inserted instead
 /// of shown match.
-/// When "accept" is true a range reaching before compl_col is applied; while the
-/// match is only browsed the buffer keeps the text it is filtered by instead.
-void ins_compl_insert(bool move_cursor, bool insert_prefix, bool accept)
+void ins_compl_insert(bool move_cursor, bool insert_prefix)
 {
   if (compl_shown_match == NULL) {
     return;
   }
 
   int compl_len = get_compl_len();
-  bool preinsert = ins_compl_has_preinsert();
+
   char *cp_str = compl_shown_match->cp_str.data;
   size_t cp_str_len = compl_shown_match->cp_str.size;
   size_t leader_len = ins_compl_leader_len();
   char *has_multiple = strchr(cp_str, '\n');
-  int range_col = -1;
-  // 'longest' never runs in a session that gives matches a start column, so
-  // these two do not meet.
   if (insert_prefix) {
     cp_str = find_common_prefix(&cp_str_len, false);
     if (cp_str == NULL) {
@@ -5485,15 +5390,6 @@ void ins_compl_insert(bool move_cursor, bool insert_prefix, bool accept)
         cp_str = compl_shown_match->cp_str.data;
         cp_str_len = compl_shown_match->cp_str.size;
       }
-    }
-  } else if (ins_compl_reaches_back(compl_shown_match)) {
-    if (accept) {
-      range_col = compl_shown_match->cp_startcol;
-    } else {
-      const String shown = ins_compl_leader_text(compl_shown_match);
-      cp_str = shown.data;
-      cp_str_len = shown.size;
-      has_multiple = strchr(cp_str, '\n');  // another string, so recompute
     }
   } else if (cpt_sources_array != NULL && compl_shown_match->cp_cpt_source_idx >= 0) {
     int startcol = cpt_sources_array[compl_shown_match->cp_cpt_source_idx].cs_startcol;
@@ -5506,15 +5402,6 @@ void ins_compl_insert(bool move_cursor, bool insert_prefix, bool accept)
     }
   }
 
-  if (range_col >= 0) {
-    // Removes text predating the completion, which ins_compl_delete() does not.
-    if (stop_arrow() == FAIL) {
-      return;
-    }
-    backspace_until_column(range_col);
-    compl_len = 0;
-  }
-
   // Make sure we don't go over the end of the string, this can happen with
   // illegal bytes.
   if (compl_len < (int)cp_str_len) {
@@ -5523,13 +5410,12 @@ void ins_compl_insert(bool move_cursor, bool insert_prefix, bool accept)
     } else {
       ins_compl_insert_bytes(cp_str + compl_len,
                              insert_prefix ? (int)cp_str_len - compl_len : -1);
-      if ((preinsert || insert_prefix) && move_cursor) {
+      if (insert_prefix && move_cursor) {
         curwin->w_cursor.col -= (colnr_T)(cp_str_len - leader_len);
       }
     }
   }
-  compl_used_match = !(match_at_original_text(compl_shown_match)
-                       || (preinsert && !insert_prefix && move_cursor));
+  compl_used_match = !match_at_original_text(compl_shown_match);
 
   dict_T *dict = ins_compl_dict_alloc(compl_shown_match);
   set_vim_var_dict(VV_COMPLETED_ITEM, dict);
@@ -5766,18 +5652,20 @@ static int ins_compl_next(bool allow_get_expansion, int count, bool insert_match
 
   // Insert the text of the new completion, or the compl_leader.
   if (!started && ins_compl_preinsert_longest()) {
-    ins_compl_insert(true, true, false);
+    ins_compl_insert(true, true);
   } else if (compl_preinsert || (compl_no_insert && !started)) {
     // 'preinsert' draws the rest as virtual text, so the buffer keeps only what
     // was typed, on every match rather than just the first.
     ins_compl_insert_bytes(ins_compl_leader() + get_compl_len(), -1);
     compl_used_match = false;
-    restore_orig_extmarks();
+    if (!started) {
+      restore_orig_extmarks();
+    }
   } else if (insert_match) {
     if (!compl_get_longest || compl_used_match) {
       bool preinsert_longest = ins_compl_preinsert_longest()
                                && match_at_original_text(compl_shown_match);  // none selected
-      ins_compl_insert(compl_preinsert || preinsert_longest, preinsert_longest, false);
+      ins_compl_insert(preinsert_longest, preinsert_longest);
     } else {
       assert(compl_leader.data != NULL);
       ins_compl_insert_bytes(compl_leader.data + get_compl_len(), -1);
@@ -6456,7 +6344,7 @@ static int ins_compl_start(void)
 
   // If any of the original typed text has been changed we need to fix
   // the redo buffer.
-  ins_compl_fixRedoBufForLeader(NULL, NULL);
+  ins_compl_fixRedoBufForLeader(NULL);
 
   // Always add completion for the original text.
   API_CLEAR_STRING(compl_orig_text);
@@ -7107,7 +6995,7 @@ int64_t ins_compl_replace_list(list_T *list, int64_t id)
   if (compl_match_array != NULL && was_inserted && compl_shown_match != NULL
       && !match_at_original_text(compl_shown_match)
       && !ins_compl_has_preinsert()) {
-    ins_compl_insert(false, false, false);
+    ins_compl_insert(false, false);
   }
 
   return id;

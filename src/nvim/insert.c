@@ -630,12 +630,12 @@ static int insert_execute(VimState *state, int key)
           && stop_arrow() == OK) {
         ins_compl_delete(false);
         if (ins_compl_preinsert_longest() && !ins_compl_is_match_selected()) {
-          ins_compl_insert(false, true, false);
+          ins_compl_insert(false, true);
           ins_compl_init_get_longest();
           return 1;  // continue
         } else {
           // Accept here, or ins_compl_stop() writes the match a second time.
-          ins_compl_insert(false, false, true);
+          ins_compl_insert(false, false);
         }
       } else if (ascii_iswhite_nl_or_nul(s->c) && ins_compl_preinsert_effect()) {
         // Delete preinserted text when typing special chars.  The match is gone

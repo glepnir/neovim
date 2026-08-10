@@ -172,25 +172,6 @@ describe('vim.lsp.completion: item conversion', function()
     return a.word > b.word
   end
 
-  it('does not filter if there is a textEdit', function()
-    local range0 = {
-      start = { line = 0, character = 0 },
-      ['end'] = { line = 0, character = 0 },
-    }
-    local completion_list = {
-      { label = 'foo', textEdit = { newText = 'foo', range = range0 } },
-      { label = 'bar', textEdit = { newText = 'bar', range = range0 } },
-    }
-    local result = complete('fo|', completion_list)
-    local expected = {
-      { abbr = 'foo', word = 'foo' },
-    }
-    local got = extract_word_abbr(result.items)
-    table.sort(expected, word_sorter)
-    table.sort(got, word_sorter)
-    eq(expected, got)
-  end)
-
   it('generate "■" symbol with highlight group for CompletionItemKind.Color', function()
     local completion_list = {
       { label = 'text-red-300', kind = 16, documentation = 'color: rgb(252, 165, 165)' },
@@ -231,248 +212,6 @@ describe('vim.lsp.completion: item conversion', function()
     eq('flush', result.items[2].word)
   end)
 
-  ---@param prefix string
-  ---@param items lsp.CompletionItem[]
-  ---@param expected table[]
-  local assert_completion_matches = function(prefix, items, expected)
-    local got = extract_word_abbr(complete(prefix .. '|', items).items)
-    table.sort(expected, word_sorter)
-    table.sort(got, word_sorter)
-    eq(expected, got)
-  end
-
-  it('filters by filterText while inserting the edit text', function()
-    local items = {
-      {
-        filterText = '<module',
-        insertTextFormat = 2,
-        kind = 10,
-        label = 'module',
-        sortText = 'module',
-        textEdit = {
-          newText = '<module>$1</module>$0',
-          range = {
-            start = { character = 0, line = 0 },
-            ['end'] = { character = 0, line = 0 },
-          },
-        },
-      },
-      {
-        filterText = 'atto',
-        insertTextFormat = 1,
-        kind = 7,
-        label = '•std::atto',
-        sortText = 'atto',
-        textEdit = {
-          newText = 'std::atto',
-          range = {
-            start = { character = 0, line = 0 },
-            ['end'] = { character = 0, line = 0 },
-          },
-        },
-      },
-      {
-        filterText = 'adopt_lock_t',
-        insertTextFormat = 1,
-        kind = 7,
-        label = '•std::adopt_lock_t',
-        sortText = 'adopt_lock_t',
-        insertText = 'std::adopt_lock_t',
-      },
-    }
-    assert_completion_matches('<mo', items, {
-      { abbr = 'module', word = 'module' },
-    })
-    assert_completion_matches('a', items, {
-      { abbr = '•std::atto', word = 'std::atto' },
-      { abbr = '•std::adopt_lock_t', word = 'std::adopt_lock_t' },
-    })
-    assert_completion_matches('', items, {
-      { abbr = 'module', word = 'module' },
-      { abbr = '•std::atto', word = 'std::atto' },
-      { abbr = '•std::adopt_lock_t', word = 'std::adopt_lock_t' },
-    })
-  end)
-
-  describe('when completeopt has fuzzy matching enabled', function()
-    before_each(function()
-      exec_lua(function()
-        vim.opt.completeopt:append('fuzzy')
-      end)
-    end)
-    after_each(function()
-      exec_lua(function()
-        vim.opt.completeopt:remove('fuzzy')
-      end)
-    end)
-
-    it('fuzzy matches on filterText', function()
-      assert_completion_matches('fo', {
-        { label = '?.foo', filterText = 'foo' },
-        { label = 'faz other', filterText = 'faz other' },
-        { label = 'bar', filterText = 'bar' },
-      }, {
-        { abbr = 'faz other', word = 'faz other' },
-        { abbr = '?.foo', word = '?.foo' },
-      })
-    end)
-
-    it('fuzzy matches on label when filterText is missing', function()
-      assert_completion_matches('fo', {
-        { label = 'foo' },
-        { label = 'faz other' },
-        { label = 'bar' },
-      }, {
-        { abbr = 'faz other', word = 'faz other' },
-        { abbr = 'foo', word = 'foo' },
-      })
-    end)
-  end)
-
-  describe('when smartcase is enabled', function()
-    before_each(function()
-      exec_lua(function()
-        vim.opt.smartcase = true
-      end)
-    end)
-    after_each(function()
-      exec_lua(function()
-        vim.opt.smartcase = false
-      end)
-    end)
-
-    it('matches filterText case sensitively', function()
-      assert_completion_matches('Fo', {
-        { label = 'foo', filterText = 'foo' },
-        { label = '?.Foo', filterText = 'Foo' },
-        { label = 'Faz other', filterText = 'Faz other' },
-        { label = 'faz other', filterText = 'faz other' },
-        { label = 'bar', filterText = 'bar' },
-      }, {
-        { abbr = '?.Foo', word = '?.Foo' },
-      })
-    end)
-
-    it('matches label case sensitively when filterText is missing', function()
-      assert_completion_matches('Fo', {
-        { label = 'foo' },
-        { label = 'Foo' },
-        { label = 'Faz other' },
-        { label = 'faz other' },
-        { label = 'bar' },
-      }, {
-        { abbr = 'Foo', word = 'Foo' },
-      })
-    end)
-
-    describe('when ignorecase is enabled', function()
-      before_each(function()
-        exec_lua(function()
-          vim.opt.ignorecase = true
-        end)
-      end)
-      after_each(function()
-        exec_lua(function()
-          vim.opt.ignorecase = false
-        end)
-      end)
-
-      it('matches filterText case insensitively if prefix is lowercase', function()
-        assert_completion_matches('fo', {
-          { label = '?.foo', filterText = 'foo' },
-          { label = '?.Foo', filterText = 'Foo' },
-          { label = 'Faz other', filterText = 'Faz other' },
-          { label = 'faz other', filterText = 'faz other' },
-          { label = 'bar', filterText = 'bar' },
-        }, {
-          { abbr = '?.Foo', word = '?.Foo' },
-          { abbr = '?.foo', word = '?.foo' },
-        })
-      end)
-
-      it(
-        'matches label case insensitively if prefix is lowercase and filterText is missing',
-        function()
-          assert_completion_matches('fo', {
-            { label = 'foo' },
-            { label = 'Foo' },
-            { label = 'Faz other' },
-            { label = 'faz other' },
-            { label = 'bar' },
-          }, {
-            { abbr = 'Foo', word = 'Foo' },
-            { abbr = 'foo', word = 'foo' },
-          })
-        end
-      )
-
-      it('matches filterText case sensitively if prefix has uppercase letters', function()
-        assert_completion_matches('Fo', {
-          { label = 'foo', filterText = 'foo' },
-          { label = '?.Foo', filterText = 'Foo' },
-          { label = 'Faz other', filterText = 'Faz other' },
-          { label = 'faz other', filterText = 'faz other' },
-          { label = 'bar', filterText = 'bar' },
-        }, {
-          { abbr = '?.Foo', word = '?.Foo' },
-        })
-      end)
-
-      it(
-        'matches label case sensitively if prefix has uppercase letters and filterText is missing',
-        function()
-          assert_completion_matches('Fo', {
-            { label = 'foo' },
-            { label = 'Foo' },
-            { label = 'Faz other' },
-            { label = 'faz other' },
-            { label = 'bar' },
-          }, {
-            { abbr = 'Foo', word = 'Foo' },
-          })
-        end
-      )
-    end)
-  end)
-
-  describe('when ignorecase is enabled', function()
-    before_each(function()
-      exec_lua(function()
-        vim.opt.ignorecase = true
-      end)
-    end)
-    after_each(function()
-      exec_lua(function()
-        vim.opt.ignorecase = false
-      end)
-    end)
-
-    it('matches filterText case insensitively', function()
-      assert_completion_matches('Fo', {
-        { label = '?.foo', filterText = 'foo' },
-        { label = '?.Foo', filterText = 'Foo' },
-        { label = 'Faz other', filterText = 'Faz other' },
-        { label = 'faz other', filterText = 'faz other' },
-        { label = 'bar', filterText = 'bar' },
-      }, {
-        { abbr = '?.Foo', word = '?.Foo' },
-        { abbr = '?.foo', word = '?.foo' },
-      })
-    end)
-
-    it('matches label case insensitively when filterText is missing', function()
-      assert_completion_matches('Fo', {
-        { label = 'foo' },
-        { label = 'Foo' },
-        { label = 'Faz other' },
-        { label = 'faz other' },
-        { label = 'bar' },
-      }, {
-        { abbr = 'Foo', word = 'Foo' },
-        { abbr = 'foo', word = 'foo' },
-      })
-    end)
-  end)
 
   it('works on non word prefix', function()
     local completion_list = {
@@ -695,8 +434,9 @@ describe('vim.lsp.completion: item conversion', function()
       word = 'this_thread',
     }
     local result = complete('  std::this|is', completion_list)
-    eq(1, #result.items)
-    local item = result.items[1]
+    local item = vim.tbl_filter(function(i)
+      return i.word == 'this_thread'
+    end, result.items)[1]
     item.user_data = nil
     eq(expected, item)
   end)
@@ -825,8 +565,10 @@ describe('vim.lsp.completion: item conversion', function()
     }
 
     local result = complete('foo.f|', completion_list)
-    eq(1, #result.items)
-    eq('foobar', result.items[1].user_data.nvim.lsp.completion_item.textEdit.newText)
+    local item = vim.tbl_filter(function(i)
+      return i.word == 'foobar'
+    end, result.items)[1]
+    eq('foobar', item.user_data.nvim.lsp.completion_item.textEdit.newText)
   end)
 
   --- @param candidates lsp.CompletionList
@@ -934,6 +676,297 @@ local function create_server(name, completion_result, opts)
     })
   end)
 end
+
+describe('vim.lsp.completion: filtering', function()
+  before_each(function()
+    clear()
+    exec_lua(create_server_definition)
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert'
+    end)
+  end)
+
+  local word_sorter = function(a, b)
+    return a.word > b.word
+  end
+
+  --- What the engine keeps of `items` once `prefix` has been typed.
+  ---
+  --- Through a real session rather than _convert_results(): the conversion is
+  --- only half of it, and a caller sees what the engine kept.
+  ---@param prefix string
+  ---@param items lsp.CompletionItem[]
+  ---@param expected table[]
+  local assert_completion_matches = function(prefix, items, expected)
+    local client_id = create_server('dummy', { isIncomplete = false, items = items })
+    -- "S" rather than "i": several calls share a buffer, and the line still
+    -- holds what the last one completed.
+    feed('S' .. prefix:gsub('<', '<lt>') .. '<C-x><C-o>')
+    if #expected > 0 then
+      wait_for_pum()
+    else
+      n.poke_eventloop()
+    end
+    local got = exec_lua(function()
+      return vim.tbl_map(function(m)
+        return { abbr = m.abbr, word = m.word }
+      end, vim.fn.complete_info({ 'matches' }).matches)
+    end)
+    table.sort(expected, word_sorter)
+    table.sort(got, word_sorter)
+    eq(expected, got)
+    feed('<C-e><Esc>')
+    exec_lua(function()
+      vim.lsp.buf_detach_client(0, client_id)
+    end)
+  end
+
+  it('keeps only what the leader matches, whatever the edit inserts', function()
+    local range0 = {
+      start = { line = 0, character = 0 },
+      ['end'] = { line = 0, character = 0 },
+    }
+    assert_completion_matches('fo', {
+      { label = 'foo', textEdit = { newText = 'foo', range = range0 } },
+      { label = 'bar', textEdit = { newText = 'bar', range = range0 } },
+    }, {
+      { abbr = 'foo', word = 'foo' },
+    })
+  end)
+
+    it('filters by filterText while inserting the edit text', function()
+      local items = {
+        {
+          filterText = '<module',
+          insertTextFormat = 2,
+          kind = 10,
+          label = 'module',
+          sortText = 'module',
+          textEdit = {
+            newText = '<module>$1</module>$0',
+            range = {
+              start = { character = 0, line = 0 },
+              ['end'] = { character = 0, line = 0 },
+            },
+          },
+        },
+        {
+          filterText = 'atto',
+          insertTextFormat = 1,
+          kind = 7,
+          label = '•std::atto',
+          sortText = 'atto',
+          textEdit = {
+            newText = 'std::atto',
+            range = {
+              start = { character = 0, line = 0 },
+              ['end'] = { character = 0, line = 0 },
+            },
+          },
+        },
+        {
+          filterText = 'adopt_lock_t',
+          insertTextFormat = 1,
+          kind = 7,
+          label = '•std::adopt_lock_t',
+          sortText = 'adopt_lock_t',
+          insertText = 'std::adopt_lock_t',
+        },
+      }
+      assert_completion_matches('<mo', items, {
+        { abbr = 'module', word = 'module' },
+      })
+      assert_completion_matches('a', items, {
+        { abbr = '•std::atto', word = 'std::atto' },
+        { abbr = '•std::adopt_lock_t', word = 'std::adopt_lock_t' },
+      })
+      assert_completion_matches('', items, {
+        { abbr = 'module', word = 'module' },
+        { abbr = '•std::atto', word = 'std::atto' },
+        { abbr = '•std::adopt_lock_t', word = 'std::adopt_lock_t' },
+      })
+    end)
+
+    describe('when completeopt has fuzzy matching enabled', function()
+      before_each(function()
+        exec_lua(function()
+          vim.opt.completeopt:append('fuzzy')
+        end)
+      end)
+      after_each(function()
+        exec_lua(function()
+          vim.opt.completeopt:remove('fuzzy')
+        end)
+      end)
+
+      it('fuzzy matches on filterText', function()
+        assert_completion_matches('fo', {
+          { label = '?.foo', filterText = 'foo' },
+          { label = 'faz other', filterText = 'faz other' },
+          { label = 'bar', filterText = 'bar' },
+        }, {
+          { abbr = 'faz other', word = 'faz other' },
+          { abbr = '?.foo', word = '?.foo' },
+        })
+      end)
+
+      it('fuzzy matches on label when filterText is missing', function()
+        assert_completion_matches('fo', {
+          { label = 'foo' },
+          { label = 'faz other' },
+          { label = 'bar' },
+        }, {
+          { abbr = 'faz other', word = 'faz other' },
+          { abbr = 'foo', word = 'foo' },
+        })
+      end)
+    end)
+
+    describe('when smartcase is enabled', function()
+      before_each(function()
+        exec_lua(function()
+          vim.opt.smartcase = true
+        end)
+      end)
+      after_each(function()
+        exec_lua(function()
+          vim.opt.smartcase = false
+        end)
+      end)
+
+      it('matches filterText case sensitively', function()
+        assert_completion_matches('Fo', {
+          { label = 'foo', filterText = 'foo' },
+          { label = '?.Foo', filterText = 'Foo' },
+          { label = 'Faz other', filterText = 'Faz other' },
+          { label = 'faz other', filterText = 'faz other' },
+          { label = 'bar', filterText = 'bar' },
+        }, {
+          { abbr = '?.Foo', word = '?.Foo' },
+        })
+      end)
+
+      it('matches label case sensitively when filterText is missing', function()
+        assert_completion_matches('Fo', {
+          { label = 'foo' },
+          { label = 'Foo' },
+          { label = 'Faz other' },
+          { label = 'faz other' },
+          { label = 'bar' },
+        }, {
+          { abbr = 'Foo', word = 'Foo' },
+        })
+      end)
+
+      describe('when ignorecase is enabled', function()
+        before_each(function()
+          exec_lua(function()
+            vim.opt.ignorecase = true
+          end)
+        end)
+        after_each(function()
+          exec_lua(function()
+            vim.opt.ignorecase = false
+          end)
+        end)
+
+        it('matches filterText case insensitively if prefix is lowercase', function()
+          assert_completion_matches('fo', {
+            { label = '?.foo', filterText = 'foo' },
+            { label = '?.Foo', filterText = 'Foo' },
+            { label = 'Faz other', filterText = 'Faz other' },
+            { label = 'faz other', filterText = 'faz other' },
+            { label = 'bar', filterText = 'bar' },
+          }, {
+            { abbr = '?.Foo', word = '?.Foo' },
+            { abbr = '?.foo', word = '?.foo' },
+          })
+        end)
+
+        it(
+          'matches label case insensitively if prefix is lowercase and filterText is missing',
+          function()
+            assert_completion_matches('fo', {
+              { label = 'foo' },
+              { label = 'Foo' },
+              { label = 'Faz other' },
+              { label = 'faz other' },
+              { label = 'bar' },
+            }, {
+              { abbr = 'Foo', word = 'Foo' },
+              { abbr = 'foo', word = 'foo' },
+            })
+          end
+        )
+
+        it('matches filterText case sensitively if prefix has uppercase letters', function()
+          assert_completion_matches('Fo', {
+            { label = 'foo', filterText = 'foo' },
+            { label = '?.Foo', filterText = 'Foo' },
+            { label = 'Faz other', filterText = 'Faz other' },
+            { label = 'faz other', filterText = 'faz other' },
+            { label = 'bar', filterText = 'bar' },
+          }, {
+            { abbr = '?.Foo', word = '?.Foo' },
+          })
+        end)
+
+        it(
+          'matches label case sensitively if prefix has uppercase letters and filterText is missing',
+          function()
+            assert_completion_matches('Fo', {
+              { label = 'foo' },
+              { label = 'Foo' },
+              { label = 'Faz other' },
+              { label = 'faz other' },
+              { label = 'bar' },
+            }, {
+              { abbr = 'Foo', word = 'Foo' },
+            })
+          end
+        )
+      end)
+    end)
+
+    describe('when ignorecase is enabled', function()
+      before_each(function()
+        exec_lua(function()
+          vim.opt.ignorecase = true
+        end)
+      end)
+      after_each(function()
+        exec_lua(function()
+          vim.opt.ignorecase = false
+        end)
+      end)
+
+      it('matches filterText case insensitively', function()
+        assert_completion_matches('Fo', {
+          { label = '?.foo', filterText = 'foo' },
+          { label = '?.Foo', filterText = 'Foo' },
+          { label = 'Faz other', filterText = 'Faz other' },
+          { label = 'faz other', filterText = 'faz other' },
+          { label = 'bar', filterText = 'bar' },
+        }, {
+          { abbr = '?.Foo', word = '?.Foo' },
+          { abbr = '?.foo', word = '?.foo' },
+        })
+      end)
+
+      it('matches label case insensitively when filterText is missing', function()
+        assert_completion_matches('Fo', {
+          { label = 'foo' },
+          { label = 'Foo' },
+          { label = 'Faz other' },
+          { label = 'faz other' },
+          { label = 'bar' },
+        }, {
+          { abbr = 'Foo', word = 'Foo' },
+          { abbr = 'foo', word = 'foo' },
+        })
+      end)
+    end)
+end)
 
 describe('vim.lsp.completion: protocol', function()
   before_each(function()
@@ -1884,16 +1917,15 @@ describe('vim.lsp.completion: integration', function()
       },
     }
 
-    it('shows the text it is filtered by while selected, and applies on accept', function()
+    it('is applied while selected, like any other match', function()
       exec_lua(function()
         vim.o.completeopt = 'menu,menuone'
       end)
       local client_id = create_server('dummy', completion_list)
       feed('ip.<C-x><C-o>')
       wait_for_pum()
-      -- The popup menu is placed from the session column, so the buffer keeps
-      -- the text this match is filtered by until it is accepted.
-      eq('p.member', n.api.nvim_get_current_line())
+      -- The item carries what it replaces, so what is written is the edit.
+      eq('p->member', n.api.nvim_get_current_line())
       feed('<C-y>')
       eq('p->member', n.api.nvim_get_current_line())
       assert_cleanup_after_detach(client_id)
@@ -1924,8 +1956,7 @@ describe('vim.lsp.completion: integration', function()
       feed('ip.<C-x><C-o>')
       wait_for_pum()
       eq('member', preview_text())
-      -- Leaving Insert mode without accepting: the preview was never in the
-      -- buffer, so there is nothing of the match left behind.
+      -- The preview was never in the buffer, so nothing of the match is left.
       feed('<Esc>')
       eq('p.', n.api.nvim_get_current_line())
       eq(nil, preview_text())
@@ -1979,7 +2010,7 @@ describe('vim.lsp.completion: integration', function()
       local client_id = create_server('dummy', completion_list)
       feed('ip.mem<C-x><C-o>')
       wait_for_pum()
-      eq('p.member', n.api.nvim_get_current_line())
+      eq('p->member', n.api.nvim_get_current_line())
       feed('<BS>')
       -- preview out whole, then one char off the leader
       eq('p.me', n.api.nvim_get_current_line())
@@ -1996,8 +2027,8 @@ describe('vim.lsp.completion: integration', function()
       feed('ip.<C-x><C-o>')
       wait_for_pum()
       eq('member', preview_text())
-      -- An incomplete list re-requests as the leader grows, which replaces the
-      -- whole list.  The preview has to be redrawn off the new one.
+      -- An incomplete list re-requests as the leader grows, replacing the whole
+      -- list.  The preview has to be redrawn off the new one.
       feed('m')
       retry(nil, nil, function()
         eq('ember', preview_text())
@@ -2057,7 +2088,7 @@ describe('vim.lsp.completion: integration', function()
       local client_id = create_server('dummy', completion_list)
       feed('ip.<C-x><C-o>')
       wait_for_pum()
-      eq('p.member', n.api.nvim_get_current_line())
+      eq('p->member', n.api.nvim_get_current_line())
       feed('<C-e>')
       eq('p.', n.api.nvim_get_current_line())
       assert_cleanup_after_detach(client_id)
@@ -2200,7 +2231,7 @@ describe('vim.lsp.completion: integration', function()
 
     it('leaves the text after the cursor by default', function()
       local client_id = create_server('dummy', completion_list)
-      feed('ifoobar<Esc>2hi<C-x><C-o>')  -- cursor after "foo"
+      feed('ifoobar<Esc>2hi<C-x><C-o>') -- cursor after "foo"
       wait_for_pum()
       feed('<C-y>')
       eq('foobazbar', n.api.nvim_get_current_line())
@@ -2209,7 +2240,7 @@ describe('vim.lsp.completion: integration', function()
 
     it("removes what the replace range covers with 'replace'", function()
       local client_id = create_server('dummy', completion_list, { insert_mode = 'replace' })
-      feed('ifoobar<Esc>2hi<C-x><C-o>')  -- cursor after "foo"
+      feed('ifoobar<Esc>2hi<C-x><C-o>') -- cursor after "foo"
       wait_for_pum()
       feed('<C-y>')
       eq('foobaz', n.api.nvim_get_current_line())
@@ -2233,7 +2264,7 @@ describe('vim.lsp.completion: integration', function()
         },
       }
       local client_id = create_server('dummy', plain, { insert_mode = 'replace' })
-      feed('ifoobar<Esc>2hi<C-x><C-o>')  -- cursor after "foo"
+      feed('ifoobar<Esc>2hi<C-x><C-o>') -- cursor after "foo"
       wait_for_pum()
       feed('<C-y>')
       eq('foobazbar', n.api.nvim_get_current_line())
@@ -2261,7 +2292,7 @@ describe('vim.lsp.completion: integration', function()
         },
       }
       local client_id = create_server('dummy', multiline, { insert_mode = 'replace' })
-      feed('ifoobar<Esc>2hi<C-x><C-o>')  -- cursor after "foo"
+      feed('ifoobar<Esc>2hi<C-x><C-o>') -- cursor after "foo"
       wait_for_pum()
       feed('<C-y>')
       -- A session lives on one line, so a range reaching off it is not applied.

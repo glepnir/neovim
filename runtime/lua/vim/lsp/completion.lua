@@ -277,31 +277,6 @@ local function get_doc(item)
   return '', default_kind
 end
 
---- Whether an item belongs in the view and how it ranks.  A miss drops it from
---- the view only; the cached answer keeps it, and a shorter leader brings it
---- back.  The engine filters the view again against the same leader.
----
----@param value string the text the item is filtered by
----@param prefix string buffer text from the item's start column to the cursor
----@param fuzzy boolean 'completeopt' has "fuzzy"; read once by the caller
----@return boolean visible
----@return integer? score ranking within the view, `nil` when unranked
-local function score_item(value, prefix, fuzzy)
-  if prefix == '' then
-    return true, nil
-  end
-  if fuzzy then
-    -- Same scorer the engine uses, see fuzzy_match_str().
-    local score = vim.fn.matchfuzzypos({ value }, prefix)[3] ---@type table
-    return #score > 0, score[1]
-  end
-
-  if vim.o.ignorecase and (not vim.o.smartcase or not prefix:find('%u')) then
-    return vim.startswith(value:lower(), prefix:lower()), nil
-  end
-  return vim.startswith(value, prefix), nil
-end
-
 --- Generate kind text for completion color items
 --- Parse color from doc and return colored symbol ■
 ---
@@ -454,17 +429,45 @@ end
 --- replaces from.
 ---
 --- @return { item: lsp.CompletionItem, word: string, start: integer? }[]
+--- @return integer? min the earliest column any item replaces from
 function M._prepare_items(result, line, lnum, cursor_col, compl_col, encoding)
   local out = {} --- @type { item: lsp.CompletionItem, word: string, start: integer? }[]
+  local min --- @type integer?
   for i, item in ipairs(get_items(result)) do
     local word, text = get_completion_word(item)
-    out[i] = {
-      item = item,
-      word = word,
-      start = item_edit_start(item, line, lnum, encoding, compl_col, cursor_col, text),
-    }
+    local start = item_edit_start(item, line, lnum, encoding, compl_col, cursor_col, text)
+    out[i] = { item = item, word = word, start = start }
+    if start and start < (min or compl_col) then
+      min = start
+    end
   end
-  return out
+  return out, min
+end
+
+--- Whether an item belongs in the view and how it ranks.  A miss drops it from
+--- the view only; the cached answer keeps it, and a shorter leader brings it
+--- back.  The engine only filters as the leader grows, so the first list has to
+--- arrive filtered.
+---
+---@param value string the text the item is filtered by
+---@param prefix string buffer text from the item's start column to the cursor
+---@param fuzzy boolean 'completeopt' has "fuzzy"; read once by the caller
+---@return boolean visible
+---@return integer? score ranking within the view, `nil` when unranked
+local function score_item(value, prefix, fuzzy)
+  if prefix == '' then
+    return true, nil
+  end
+  if fuzzy then
+    -- Same scorer the engine uses, see fuzzy_match_str().
+    local score = vim.fn.matchfuzzypos({ value }, prefix)[3] ---@type table
+    return #score > 0, score[1]
+  end
+
+  if vim.o.ignorecase and (not vim.o.smartcase or not prefix:find('%u')) then
+    return vim.startswith(value:lower(), prefix:lower()), nil
+  end
+  return vim.startswith(value, prefix), nil
 end
 
 --- Turns the result of a `textDocument/completion` request into vim-compatible
@@ -483,6 +486,7 @@ end
 function M._lsp_to_complete_items(
   result,
   compl_col,
+  word_col,
   cursor_col,
   client_id,
   line,
@@ -496,9 +500,6 @@ function M._lsp_to_complete_items(
   end
 
   local view = {} --- @type { item: table, score: integer? }[]
-  -- Earliest column any item replaces from; decides whether there is anything
-  -- to rank by, since an item reaching back is filtered by that text too.
-  local min_start = nil ---@type integer?
   local fuzzy = has_completeopt('fuzzy')
   local popup = has_completeopt('popup')
   local bufnr = api.nvim_get_current_buf()
@@ -522,25 +523,19 @@ function M._lsp_to_complete_items(
 
   for _, entry in ipairs(prepared) do
     local item = entry.item
-    local word = entry.word
     local item_start = entry.start
+    local word --- @type string?
 
-    if item_start and item_start < compl_col and (not min_start or item_start < min_start) then
-      min_start = item_start
-    end
+    local prefix = line and line:sub(compl_col + 1, cursor_col) or ''
 
-    local prefix_start = item_start and math.min(item_start, compl_col) or compl_col
-    local prefix = line and line:sub(prefix_start + 1, cursor_col) or ''
-
-    -- The spec has a replace range denote the word an item is filtered by, so a
-    -- "filterText" is expected to span it.  Servers routinely send one that only
-    -- describes the word, and nvim__complete() drops an item whose two disagree.
+    -- The two spans differ: the word above keeps the text its own edit leaves
+    -- alone, while the filter text also covers what the edit replaces, since a
+    -- "filterText" describes the word boundary onwards (clangd's range covers
+    -- the `.`, its filterText does not).
+    local filter_pad = line and line:sub(compl_col + 1, word_col) or ''
     local filter_text = item.filterText or item.label
-    if line and item_start and item_start < compl_col then
-      local pad = line:sub(item_start + 1, compl_col)
-      if not vim.startswith(filter_text, pad) then
-        filter_text = pad .. filter_text
-      end
+    if not vim.startswith(filter_text, filter_pad) then
+      filter_text = filter_pad .. filter_text
     end
 
     local visible, score ---@type boolean, integer?
@@ -551,6 +546,13 @@ function M._lsp_to_complete_items(
     end
 
     if visible then
+      word = get_completion_word(item)
+      -- The engine writes from the session column, so an item starting after it
+      -- carries the text in between.
+      if line and item_start and item_start > compl_col then
+        word = line:sub(compl_col + 1, item_start) .. word
+      end
+
       local hl_group = ''
       if
         item.deprecated
@@ -574,7 +576,6 @@ function M._lsp_to_complete_items(
         filter_text = filter_text,
         -- Per item: an item reaching back over the `.` and one that does not can
         -- be in the same list.  Absent means the session column.
-        startcol = item_start and item_start < compl_col and item_start + 1 or nil,
         abbr = ('%s%s'):format(item.label, vim.tbl_get(item, 'labelDetails', 'detail') or ''),
         kind = kind,
         menu = vim.tbl_get(item, 'labelDetails', 'description') or '',
@@ -613,7 +614,7 @@ function M._lsp_to_complete_items(
       return (itema.sortText or itema.label) < (itemb.sortText or itemb.label)
     end
 
-    local base_prefix = line and line:sub((min_start or compl_col) + 1, cursor_col) or ''
+    local base_prefix = line and line:sub(compl_col + 1, cursor_col) or ''
     local use_fuzzy_sort = fuzzy
       and not has_completeopt('nosort')
       and not result.isIncomplete
@@ -652,11 +653,13 @@ function M._convert_results(
   compl_col,
   result,
   encoding,
-  prepared
+  prepared,
+  word_col
 )
   return M._lsp_to_complete_items(
     result,
     compl_col,
+    word_col or compl_col,
     cursor_col,
     client_id,
     line,
@@ -1035,13 +1038,25 @@ end
 --- @param compl_col integer 0-indexed column the list is anchored at
 --- @param cursor_col integer 0-indexed column the prefix ends at
 --- @return table[]
-local function build_view(session, ctx, line, compl_col, cursor_col)
+--- @return table[] view
+--- @return integer compl_col 0-indexed column the list has to be anchored at
+local function build_view(session, ctx, line, word_col, cursor_col)
+  local prepared = {} --- @type table<integer, table[]>
+  local compl_col = word_col
+  for _, client_id in ipairs(sorted_keys(session.responses)) do
+    local cached = session.responses[client_id]
+    local items, min =
+      M._prepare_items(cached.result, line, ctx.row - 1, cursor_col, word_col, cached.encoding)
+    prepared[client_id] = items
+    if min and min < compl_col then
+      compl_col = min
+    end
+  end
+
   local matches = {} --- @type table[]
   for _, client_id in ipairs(sorted_keys(session.responses)) do
     local cached = session.responses[client_id]
-    local prepared =
-      M._prepare_items(cached.result, line, ctx.row - 1, cursor_col, compl_col, cached.encoding)
-    if #prepared > 0 then
+    if #prepared[client_id] > 0 then
       vim.list_extend(
         matches,
         M._convert_results(
@@ -1052,7 +1067,8 @@ local function build_view(session, ctx, line, compl_col, cursor_col)
           compl_col,
           cached.result,
           cached.encoding,
-          prepared
+          prepared[client_id],
+          word_col
         )
       )
     end
@@ -1069,7 +1085,7 @@ local function build_view(session, ctx, line, compl_col, cursor_col)
   -- match list was replaced. Copied, so the kept list stays whole.
   local view = vim.list_extend({}, session.other_items or {})
   vim.list_extend(view, matches)
-  return view
+  return view, compl_col
 end
 
 --- Hands a new list to the completion engine.
@@ -1095,16 +1111,20 @@ local function publish(session, ctx)
       line = ctx.line:sub(1, col - 1) .. session.leader .. ctx.line:sub(cursor_col + 1)
       cursor_col = col - 1 + #session.leader
     end
-    local view = build_view(session, ctx, line, col - 1, cursor_col)
-    if api.nvim__complete({ id = session.id, items = view }) ~= -1 then
+    -- The word boundary sits at or after the session column; measuring it on the
+    -- rebuilt line is what the items are padded against.
+    local word_col = vim.fn.match(line:sub(1, cursor_col), '\\k*$')
+    local view, start = build_view(session, ctx, line, math.max(col - 1, word_col), cursor_col)
+    -- The engine cannot move a running session's column, so a batch reaching
+    -- further back needs a new session.
+    if start >= col - 1 and api.nvim__complete({ id = session.id, items = view }) ~= -1 then
       return
     end
-    -- The session ended while the request was in flight; start a new one.
     session.id, session.col = nil, nil
   end
 
-  local col = ctx.word_col + 1
-  local view = build_view(session, ctx, ctx.line, ctx.word_col, ctx.cursor_col)
+  local view, start = build_view(session, ctx, ctx.line, ctx.word_col, ctx.cursor_col)
+  local col = start + 1
   local id = api.nvim__complete({ col = col, items = view })
   session.id = id > 0 and id or nil
   session.col = session.id and col or nil
@@ -1360,7 +1380,7 @@ local function on_complete_done(bufnr)
     end
     -- Only the snippet path needs a column.  An item that replaces text in
     -- front of the word carries its own; the rest start where the session did.
-    local start_col = completed_item.startcol or session_col
+    local start_col = session_col
     if not start_col then
       return
     end
