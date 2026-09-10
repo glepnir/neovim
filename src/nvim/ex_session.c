@@ -1024,7 +1024,7 @@ void ex_mkrc(exarg_T *eap)
     }
 
     if (eap->cmdidx == CMD_mksession) {
-      apply_autocmds(EVENT_SESSIONWRITEPRE, NULL, NULL, false, curbuf);
+      apply_autocmds(EVENT_SESSIONWRITEPRE, NULL, NULL, false, curbuf, curwin);
     }
 
     // Write the version command for :mkvimrc
@@ -1132,9 +1132,13 @@ void ex_mkrc(exarg_T *eap)
 
   xfree(viewFile);
 
+<<<<<<< HEAD
   if (eap->cmdidx == CMD_mksession) {
     apply_autocmds(EVENT_SESSIONWRITEPOST, NULL, NULL, false, curbuf);
   }
+=======
+  apply_autocmds(EVENT_SESSIONWRITEPOST, NULL, NULL, false, curbuf, curwin);
+>>>>>>> 09de92ca15 (fix(events): ev.win is set to the wrong window)
 }
 
 /// @return  the name of the view file for the current buffer.
