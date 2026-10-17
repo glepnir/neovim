@@ -204,6 +204,7 @@ describe('vim.lsp.completion: item conversion', function()
         detail = 'int',
         sortText = '1',
         labelDetails = { detail = '(const char *restrict, ...)', description = 'stdio.h' },
+        documentation = { kind = 'plaintext', value = 'Writes formatted output.' },
       },
       {
         label = ' flush',
@@ -218,6 +219,7 @@ describe('vim.lsp.completion: item conversion', function()
     local result = complete('|', completion_list)
     eq('printf(const char *restrict, ...)', result.items[1].abbr)
     eq('stdio.h', result.items[1].menu)
+    eq('int\nWrites formatted output.', result.items[1].info)
     eq('flush', result.items[2].word)
   end)
 

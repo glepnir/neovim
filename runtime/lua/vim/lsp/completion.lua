@@ -412,11 +412,14 @@ end
 local function complete_item_info(item, popup)
   local info, kind = get_doc(item)
 
-  if item.detail and item.detail ~= '' then
-    local detail_block = ('```%s\n%s\n```'):format(vim.bo.filetype, item.detail)
+  local detail = item.detail
+  if detail and detail ~= '' then
+    local detail_block = kind == protocol.MarkupKind.Markdown
+        and ('```%s\n%s\n```'):format(vim.bo.filetype, detail)
+      or detail
     if info == '' then
       info = detail_block
-    elseif not info:find(item.detail, 1, true) then
+    elseif not info:find(detail, 1, true) then
       info = detail_block .. '\n' .. info
     end
   end
