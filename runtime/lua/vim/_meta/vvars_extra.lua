@@ -37,6 +37,8 @@ error('Cannot require a meta file')
 --- override the |hl-PmenuKind| highlight group, allowing for the customization
 --- of ctermfg and guifg properties for the completion kind
 --- @field kind_hlgroup? string
+--- @field startcol? integer byte column "word" starts at, starting at 1
+--- @field filter_text? string text this item is filtered by instead of "word"
 
 --- @class vim.v.event
 --- Whether the event triggered during an aborting condition (e.g. |c_Esc| or
@@ -62,6 +64,7 @@ error('Cannot require a meta file')
 --- Current selected complete item on |CompleteChanged|, Is `{}` when no
 --- complete item selected.
 --- @field completed_item? vim.v.completed_item
+--- @field complete_leader? string What |CompleteChanged| is filtering by.
 --- @field height? integer Height of popup menu on |CompleteChanged|
 --- @field width? integer Width of popup menu on |CompleteChanged|
 --- @field row? integer Row count of popup menu on |CompleteChanged|, relative to screen.

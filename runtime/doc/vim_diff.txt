@@ -426,6 +426,8 @@ Options:
 - 'background'  cannot be set to empty.
 - 'completeopt' flag "preselect" selects first completion item that has the
                 "preselect" attribute set.
+- 'completeopt' flag "preinsert" shows the text as virtual text instead of
+                inserting it, also with "fuzzy" and without a menu.
 - 'cpoptions'   flags: |cpo-_|
 - 'eadirection' cannot be set to empty.
 - 'exrc'        searches for ".nvim.lua", ".nvimrc", or ".exrc" files. The

@@ -1115,6 +1115,8 @@ function vim.fn.complete(startcol, matches) end
 --- Returns 0 for failure (empty string or out of memory),
 --- 1 when the match was added, 2 when the match was already in
 --- the list.
+--- Also returns 0 for |nvim__complete()| candidates, whose list
+--- is replaced whole.
 --- See |complete-functions| for an explanation of {expr}.  It is
 --- the same as one item in the list that 'omnifunc' would return.
 ---
@@ -1150,8 +1152,9 @@ function vim.fn.complete_check() end
 ---     "user_data". The highlight group entries hold
 ---     the name that the item was added with,
 ---     or an empty string.
----     "equal", "preselect" and "commit_chars" are
----     included only for items that set them.
+---     "equal", "preselect", "commit_chars",
+---     "startcol" and "filter_text" are included only
+---     for items that set them.
 ---     See |complete-items|.
 ---    matches  Same as "items", but only returns items that
 ---     are matching current query.  If both "matches"
@@ -1161,8 +1164,9 @@ function vim.fn.complete_check() end
 ---    mode    Current completion mode name string.
 ---     See |complete_info_mode| for the values.
 ---    preinserted_text
----     The actual text that is pre-inserted, see
----     |preinserted()|.
+---     Deprecated.  The text "longest" inserted ahead of
+---     the cursor; empty for the "preinsert" preview,
+---     which is virtual text.  See |preinserted()|.
 ---    pum_visible  |TRUE| if popup menu is visible.
 ---     See |pumvisible()|.
 ---    selected  Selected item index.  First index is zero.
@@ -6849,10 +6853,14 @@ function vim.fn.perleval(expr) end
 --- @return number
 function vim.fn.pow(x, y) end
 
+--- @deprecated
 --- Returns non-zero if text has been inserted after the cursor
---- because "preinsert" is present in 'completeopt', or because
---- "longest" is present in 'completeopt' while 'autocomplete'
---- is active.  Otherwise returns zero.
+--- because "longest" is present in 'completeopt' while
+--- 'autocomplete' is active.  Otherwise returns zero.
+---
+--- The "preinsert" preview is virtual text, which this cannot
+--- report: read the extmark in the "nvim.completion.preinsert"
+--- namespace instead.
 ---
 --- @return number
 function vim.fn.preinserted() end

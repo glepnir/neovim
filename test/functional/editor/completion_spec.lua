@@ -1151,6 +1151,36 @@ describe('completion', function()
     end)
   end)
 
+  it("'ignorecase' folds multibyte letters", function()
+    command('set ignorecase completeopt=menuone,noselect')
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'über' })
+    local function words()
+      return vim.tbl_map(function(m)
+        return m.word
+      end, fn.complete_info({ 'matches' }).matches)
+    end
+    feed('oÜ<C-N>b')
+    eq({ 'über' }, words())
+    feed('<C-E><Esc>')
+    fn.setreg('a', 'über')
+    feed('oÜ<C-X><C-R>')
+    eq({ 'über' }, words())
+  end)
+
+  it('keeps the order of equal fuzzy scores as the leader changes', function()
+    command('set completeopt=menu,menuone,noselect,fuzzy')
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'xbc xba' })
+    local function words()
+      return vim.tbl_map(function(m)
+        return m.word
+      end, fn.complete_info({ 'items' }).items)
+    end
+    feed('o<C-N>b')
+    eq({ 'xbc', 'xba' }, words())
+    feed('a<BS>')
+    eq({ 'xbc', 'xba' }, words())
+  end)
+
   it("'ignorecase' 'infercase' CTRL-X CTRL-N #6451", function()
     command('set ignorecase infercase')
     command('edit runtime/doc/credits.txt')
@@ -1167,6 +1197,29 @@ describe('completion', function()
       {5:-- Keyword Local completion (^N^P) }{6:match 1 of 10}            |
     ]],
     }
+  end)
+
+  it('loads the "preinsert" preview only once it is in effect', function()
+    local loaded = "return package.loaded['vim._core.completion.preinsert'] ~= nil"
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'foo far' })
+    feed('of<C-N><C-E><Esc>')
+    eq(false, exec_lua(loaded))
+    command('set completeopt+=preinsert')
+    feed('of<C-N><C-E><Esc>')
+    eq(true, exec_lua(loaded))
+  end)
+
+  it("previews a match 'ignorecase' found by a multibyte letter", function()
+    command('set ignorecase completeopt=menu,menuone,preinsert')
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'éxyz' })
+    feed('oÉx<C-X><C-N>')
+    local ns = api.nvim_create_namespace('nvim.completion.preinsert')
+    eq(
+      { 'yz' },
+      vim.tbl_map(function(m)
+        return m[4].virt_text[1][1]
+      end, api.nvim_buf_get_extmarks(0, ns, 0, -1, { details = true }))
+    )
   end)
 
   it('CompleteChanged autocommand', function()
@@ -1200,10 +1253,16 @@ describe('completion', function()
         pos = -1,
       },
     })
-    eq(
-      { completed_item = {}, width = 0, height = 2, size = 2, col = 0, row = 4, scrollbar = false },
-      eval('g:event')
-    )
+    eq({
+      completed_item = {},
+      width = 0,
+      height = 2,
+      size = 2,
+      col = 0,
+      row = 4,
+      scrollbar = false,
+      complete_leader = 'f',
+    }, eval('g:event'))
     feed('oob')
     screen:expect({
       grid = [[
@@ -1220,10 +1279,16 @@ describe('completion', function()
         pos = -1,
       },
     })
-    eq(
-      { completed_item = {}, width = 0, height = 1, size = 1, col = 0, row = 4, scrollbar = false },
-      eval('g:event')
-    )
+    eq({
+      completed_item = {},
+      width = 0,
+      height = 1,
+      size = 1,
+      col = 0,
+      row = 4,
+      scrollbar = false,
+      complete_leader = 'foob',
+    }, eval('g:event'))
     feed('<Esc>')
     screen:set_option('ext_popupmenu', false)
 
@@ -1238,10 +1303,16 @@ describe('completion', function()
       {1:~                                                           }|
       {5:-- Keyword completion (^N^P) }{19:Back at original}               |
     ]])
-    eq(
-      { completed_item = {}, width = 15, height = 2, size = 2, col = 0, row = 4, scrollbar = false },
-      eval('g:event')
-    )
+    eq({
+      completed_item = {},
+      width = 15,
+      height = 2,
+      size = 2,
+      col = 0,
+      row = 4,
+      scrollbar = false,
+      complete_leader = 'f',
+    }, eval('g:event'))
     feed('<C-N>')
     screen:expect([[
       foo                                                         |
@@ -1935,6 +2006,30 @@ describe('completion', function()
     eq({ 'A', 'B', 'C', 'sub1/', 'sub2/' }, fn.getcompletion('find ', 'cmdline'))
   end)
 
+  it('repeats a match of a completion function from where it starts', function()
+    exec_lua(function()
+      _G.F = function(findstart)
+        return findstart == 1 and 0 or { 'foo.bar' }
+      end
+    end)
+    command('set complete=Fv:lua.F completeopt=menu')
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'foo.ba', 'foo.ba' })
+    feed('A<C-n><Esc>j$.')
+    eq({ 'foo.bar', 'foo.bar' }, api.nvim_buf_get_lines(0, 0, -1, true))
+  end)
+
+  it("inserts the common part of a completion function's matches from where they start", function()
+    exec_lua(function()
+      _G.F = function(findstart)
+        return findstart == 1 and 3 or { '.nx', '.ny' }
+      end
+    end)
+    command('set complete=Fv:lua.F autocomplete completeopt=menu,menuone,longest')
+    feed('io.m.')
+    poke_eventloop()
+    eq('o.m.n', api.nvim_get_current_line())
+  end)
+
   it('complete-items commit_chars', function()
     exec_lua(function()
       _G.Omnifunc = function(findstart, _)
@@ -1961,6 +2056,92 @@ describe('completion', function()
     end)
     feed('<Esc>cc<F5><F5>')
     eq('discard', exec_lua('return _G.reason'))
+  end)
+
+  it('complete-items "startcol" and "filter_text"', function()
+    exec_lua(function()
+      vim.o.completeopt = 'menu,menuone,noinsert'
+      vim.keymap.set('i', '<F5>', function()
+        vim.fn.complete(vim.fn.col('.'), _G.items)
+      end)
+    end)
+    local function words(what)
+      return vim.tbl_map(function(item)
+        return item.word
+      end, fn.complete_info({ what })[what])
+    end
+    exec_lua(function()
+      _G.items = {
+        { word = '.nn', startcol = 4 },
+        { word = '->nn', startcol = 4 },
+        { word = 'zz', filter_text = 'nz' },
+        { word = 'z', startcol = 6 },
+      }
+    end)
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'o.m.', 'o.m.' })
+    feed('A<F5>')
+    eq({ '.nn', 'zz' }, words('items'))
+    eq(4, fn.complete_info({ 'items' }).items[1].startcol)
+    eq('nz', fn.complete_info({ 'items' }).items[2].filter_text)
+    feed('n')
+    eq({ '.nn', 'zz' }, words('matches'))
+    feed('n')
+    eq({ '.nn' }, words('matches'))
+    feed('<C-y><Esc>j$.')
+    eq({ 'o.m.nn', 'o.m.nn' }, api.nvim_buf_get_lines(0, 0, -1, true))
+
+    exec_lua(function()
+      _G.items = {
+        { word = 'p.x', startcol = 1, icase = 1 },
+        { word = 'p.y', startcol = 1 },
+      }
+    end)
+    feed('<Esc>ccP.<F5>')
+    eq({ 'p.x' }, words('items'))
+
+    exec_lua(function()
+      _G.items = { { word = '.nn', startcol = 4 } }
+    end)
+    command('set completeopt=menu,menuone,preinsert')
+    feed('<Esc>cco.m.<F5><C-y>')
+    eq('o.m.nn', api.nvim_get_current_line())
+    command('set completeopt=menu,menuone,longest')
+    feed('<Esc>cco.m.<F5>')
+    eq({}, words('items'))
+
+    exec_lua(function()
+      _G.F = function(findstart)
+        return findstart == 1 and 0 or { { word = 'barbaz', startcol = 5 }, { word = 'foo.bar' } }
+      end
+    end)
+    command('set complete=Fv:lua.F completeopt=menu,menuone,noinsert')
+    feed('<Esc>ccfoo.ba<C-n><C-y>')
+    eq('foo.barbaz', api.nvim_get_current_line())
+    feed('<Esc>ccfoo.<C-n><C-p><C-l>')
+    eq('foo.b', api.nvim_get_current_line())
+
+    exec_lua(function()
+      _G.items = { { word = 'zz', filter_text = 'nz' }, { word = 'zy', filter_text = '' } }
+    end)
+    feed('<Esc>cc<F5><C-l>')
+    eq('n', api.nvim_get_current_line())
+    command('set completeopt=menu,menuone,noinsert,fuzzy')
+    feed('<Esc>cc<F5>z')
+    eq({ 'zy', 'zz' }, words('matches'))
+    feed('<C-n><C-y>')
+    eq('zz', api.nvim_get_current_line())
+
+    exec_lua(function()
+      _G.Omni = function(findstart)
+        return findstart == 1 and 4 or { 'zz', { word = '.abc', startcol = 4 } }
+      end
+      vim.bo.omnifunc = 'v:lua.Omni'
+    end)
+    command('set completeopt=menu,menuone,noselect')
+    feed('<Esc>cco.m.<C-x><C-o>a')
+    poke_eventloop()
+    feed('<C-l>')
+    eq('o.m.ab', api.nvim_get_current_line())
   end)
 
   it('complete_info() reports completion item fields', function()

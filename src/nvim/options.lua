@@ -1694,7 +1694,8 @@ local options = {
         	    completion |compl-thesaurus|).  If the popup menu is
         	    displayed, you can use CTRL-L to add more characters.
         	    Whether case is ignored depends on the type of completion.
-        	    For buffer text the 'ignorecase' option applies.
+        	    For buffer text the 'ignorecase' option applies.  For
+        	    |nvim__complete()| candidates it acts like "noselect".
 
         	    When 'autocomplete' is active and no completion item is
         	    selected, the longest common prefix of the matches is
@@ -1742,14 +1743,12 @@ local options = {
         	    with "menu" or "menuone".  Overrides "preview".
 
            preinsert
-        	    Inserts the text of the first completion candidate beyond
-        	    the current leader, highlighted with |hl-PreInsert|.
-        	    The cursor does not move.
-        	    Requires "fuzzy" to be unset, and either "menuone" in
-        	    'completeopt' or 'autocomplete' enabled.  When
-        	    'autocomplete' is enabled, this does not work if
+        	    Shows the text of the selected completion candidate beyond
+        	    the current leader as virtual text, highlighted with
+        	    |hl-PreInsert|.  The cursor does not move.  With "fuzzy",
+        	    only a candidate that continues the leader is previewed.
+        	    When 'autocomplete' is enabled, this does not work if
         	    'ignorecase' is set without 'infercase'.
-        	    See also |preinserted()|.
 
            preselect
         	    When one of |complete-items| has its "preselect" field set

@@ -4370,18 +4370,19 @@ func Test_completeopt_preinsert()
   new
   inoremap <buffer><F5> <C-R>=GetLine()<CR>
   call feedkeys("S\<C-X>\<C-O>f\<F5>\<ESC>", 'tx')
-  call assert_equal("fobar", g:line)
+  " Nvim: the "preinsert" preview is virtual text, not in the line.
+  call assert_equal("f", g:line)
   call assert_equal(2, g:col)
 
   call feedkeys("S\<C-X>\<C-O>foo\<F5>\<ESC>", 'tx')
-  call assert_equal("foobar", g:line)
+  call assert_equal("foo", g:line)
 
   call feedkeys("S\<C-X>\<C-O>foo\<BS>\<BS>\<BS>", 'tx')
   call assert_equal("", getline('.'))
 
   " delete a character and input new leader
   call feedkeys("S\<C-X>\<C-O>foo\<BS>b\<F5>\<ESC>", 'tx')
-  call assert_equal("fobar", g:line)
+  call assert_equal("fob", g:line)
   call assert_equal(4, g:col)
 
   " delete preinsert when prepare completion
@@ -4389,15 +4390,15 @@ func Test_completeopt_preinsert()
   call assert_equal("f ", getline('.'))
 
   call feedkeys("S\<C-X>\<C-O>你\<F5>\<ESC>", 'tx')
-  call assert_equal("你的", g:line)
+  call assert_equal("你", g:line)
   call assert_equal(4, g:col)
 
   call feedkeys("S\<C-X>\<C-O>你好\<F5>\<ESC>", 'tx')
-  call assert_equal("你好世界", g:line)
+  call assert_equal("你好", g:line)
   call assert_equal(7, g:col)
 
   call feedkeys("Shello   wo\<Left>\<Left>\<Left>\<C-X>\<C-O>f\<F5>\<ESC>", 'tx')
-  call assert_equal("hello  fobar wo", g:line)
+  call assert_equal("hello  f wo", g:line)
   call assert_equal(9, g:col)
 
   call feedkeys("Shello   wo\<Left>\<Left>\<Left>\<C-X>\<C-O>f\<BS>\<F5>\<ESC>", 'tx')
@@ -4405,11 +4406,11 @@ func Test_completeopt_preinsert()
   call assert_equal(8, g:col)
 
   call feedkeys("Shello   wo\<Left>\<Left>\<Left>\<C-X>\<C-O>foo\<F5>\<ESC>", 'tx')
-  call assert_equal("hello  foobar wo", g:line)
+  call assert_equal("hello  foo wo", g:line)
   call assert_equal(11, g:col)
 
   call feedkeys("Shello   wo\<Left>\<Left>\<Left>\<C-X>\<C-O>foo\<BS>b\<F5>\<ESC>", 'tx')
-  call assert_equal("hello  fobar wo", g:line)
+  call assert_equal("hello  fob wo", g:line)
   call assert_equal(11, g:col)
 
   " confirm
@@ -4423,7 +4424,7 @@ func Test_completeopt_preinsert()
   call assert_equal(2, col('.'))
 
   call feedkeys("S hello hero\<CR>h\<C-X>\<C-N>\<F5>\<ESC>", 'tx')
-  call assert_equal("hello", g:line)
+  call assert_equal("h", g:line)
   call assert_equal(2, col('.'))
 
   call feedkeys("Sh\<C-X>\<C-N>\<C-Y>", 'tx')
@@ -4445,22 +4446,22 @@ func Test_completeopt_preinsert()
 
   " whole line
   call feedkeys("Shello hero\<CR>\<C-X>\<C-L>\<F5>\<ESC>", 'tx')
-  call assert_equal("hello hero", g:line)
+  call assert_equal("", g:line)
   call assert_equal(1, g:col)
 
   call feedkeys("Shello hero\<CR>he\<C-X>\<C-L>\<F5>\<ESC>", 'tx')
-  call assert_equal("hello hero", g:line)
+  call assert_equal("he", g:line)
   call assert_equal(3, g:col)
 
   call feedkeys("Shello hero\<CR>h\<C-X>\<C-N>er\<F5>\<ESC>", 'tx')
-  call assert_equal("hero", g:line)
+  call assert_equal("her", g:line)
   call assert_equal(4, g:col)
 
-  " can not work with fuzzy
+  " Nvim: works with fuzzy too, the preview being virtual text
   set cot+=fuzzy
   call feedkeys("S\<C-X>\<C-O>", 'tx')
-  call assert_equal("fobar", getline('.'))
-  call assert_equal(5, col('.'))
+  call assert_equal("", getline('.'))
+  call assert_equal(1, col('.'))
 
   " test for fuzzy and noinsert
   set cot+=noinsert
@@ -4476,20 +4477,20 @@ func Test_completeopt_preinsert()
   call assert_equal("fobar", getline('.'))
   call assert_equal(5, col('.'))
 
-  " When the pum is not visible, the preinsert has no effect
+  " Nvim: without the pum too, the preview being virtual text
   set cot=preinsert
   call feedkeys("Sfoo1 foo2\<CR>f\<C-X>\<C-N>bar", 'tx')
-  call assert_equal("foo1bar", getline('.'))
-  call assert_equal(7, col('.'))
+  call assert_equal("fbar", getline('.'))
+  call assert_equal(4, col('.'))
 
   set cot=preinsert,menuone
   call feedkeys("Sfoo1 foo2\<CR>f\<C-X>\<C-N>\<F5>\<ESC>", 'tx')
-  call assert_equal("foo1", g:line)
+  call assert_equal("f", g:line)
   call assert_equal(2, g:col)
 
   inoremap <buffer> <f3> <cmd>call complete(4, [{'word': "fobar"}, {'word': "foobar"}])<CR>
   call feedkeys("Swp.\<F3>\<F5>\<BS>\<ESC>", 'tx')
-  call assert_equal("wp.fobar", g:line)
+  call assert_equal("wp.", g:line)
   call assert_equal(4, g:col)
   call assert_equal("wp.", getline('.'))
 
@@ -4558,18 +4559,19 @@ func Test_autocomplete_completeopt_preinsert()
   new
   inoremap <buffer><F5> <C-R>=GetLine()<CR>
   call feedkeys("Sfo\<F5>\<ESC>", 'tx')
-  call assert_equal("fobar", g:line)
+  " Nvim: the "preinsert" preview is virtual text, not in the line.
+  call assert_equal("fo", g:line)
   call assert_equal(3, g:col)
 
   call feedkeys("Sfoo\<F5>\<ESC>", 'tx')
-  call assert_equal("foobar", g:line)
+  call assert_equal("foo", g:line)
 
   call feedkeys("Sfoo\<BS>\<BS>\<BS>", 'tx')
   call assert_equal("", getline('.'))
 
   " delete a character
   call feedkeys("Sfoo\<BS>b\<F5>\<ESC>", 'tx')
-  call assert_equal("fobar", g:line)
+  call assert_equal("fob", g:line)
   call assert_equal(4, g:col)
 
   set complete&
@@ -4577,11 +4579,11 @@ func Test_autocomplete_completeopt_preinsert()
   call setline(1, ['fobar', 'foobar'])
 
   call feedkeys("Gofoo\<BS>\<BS>\<F5>\<ESC>", 'tx')
-  call assert_equal("fobar", g:line)
+  call assert_equal("f", g:line)
   call assert_equal(2, g:col)
 
   call feedkeys("Shello   wo\<Left>\<Left>\<Left>f\<F5>\<ESC>", 'tx')
-  call assert_equal("hello  fobar wo", g:line)
+  call assert_equal("hello  f wo", g:line)
   call assert_equal(9, g:col)
 
   call feedkeys("Shello   wo\<Left>\<Left>\<Left>f\<BS>\<F5>\<ESC>", 'tx')
@@ -4589,11 +4591,11 @@ func Test_autocomplete_completeopt_preinsert()
   call assert_equal(8, g:col)
 
   call feedkeys("Shello   wo\<Left>\<Left>\<Left>foo\<F5>\<ESC>", 'tx')
-  call assert_equal("hello  foobar wo", g:line)
+  call assert_equal("hello  foo wo", g:line)
   call assert_equal(11, g:col)
 
   call feedkeys("Shello   wo\<Left>\<Left>\<Left>foo\<BS>b\<F5>\<ESC>", 'tx')
-  call assert_equal("hello  fobar wo", g:line)
+  call assert_equal("hello  fob wo", g:line)
   call assert_equal(11, g:col)
 
   " confirm
@@ -4625,7 +4627,7 @@ func Test_autocomplete_completeopt_preinsert()
   call assert_equal("f", g:line)  " should not produce 'FIX'
   set infercase
   call feedkeys("Gof\<F5>\<ESC>", 'tx')
-  call assert_equal("fix", g:line)
+  call assert_equal("f", g:line)
   set ignorecase& infercase&
 
   %delete _
@@ -6303,8 +6305,9 @@ func Test_autocomplete_longest()
   set autocomplete completeopt+=longest,preinsert
   call setline(1, ['foobar', 'foofoo', 'foobaz', ''])
   call feedkeys("G", 'tx')
-  call DoTest("f", 'foobar', 2)
-  call assert_equal(1, g:preinserted)
+  " Nvim: the "preinsert" preview is virtual text, not in the line.
+  call DoTest("f", 'f', 2)
+  call assert_equal(0, g:preinserted)
 
   " complete_info()
   %delete
@@ -6317,7 +6320,7 @@ func Test_autocomplete_longest()
 
   set completeopt& completeopt+=preinsert
   call feedkeys("G4li\<F6>\<C-Y>", 'tx')
-  call assert_equal("bar_xyz", g:cinfo.preinserted_text)
+  call assert_equal("", g:cinfo.preinserted_text)
 
   set completeopt& completeopt+=longest
   call feedkeys("Gof\<F6>\<ESC>", 'tx')
@@ -6573,7 +6576,8 @@ func Test_autocomplete_preinsert_null_leader()
   " Type 'y': "key" should be filtered out (doesn't start with 'y'),
   " "yellow" should be the only PUM entry and preinserted with cursor after 'y'.
   call feedkeys("iy\<F5>\<C-E>\<Esc>", 'tx')
-  call assert_equal("yellow", g:line)
+  " Nvim: the "preinsert" preview is virtual text, not in the line.
+  call assert_equal("y", g:line)
   call assert_equal(2, g:col)
   call assert_equal(['yellow'], g:matches)
 

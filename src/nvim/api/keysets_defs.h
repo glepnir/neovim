@@ -148,6 +148,13 @@ typedef struct {
 } Dict(cmd_opts);
 
 typedef struct {
+  OptionalKeys is_set__complete_;
+  Integer col;
+  Integer id;
+  Array items;
+} Dict(complete);
+
+typedef struct {
   OptionalKeys is_set__complete_set_;
   String info;
 } Dict(complete_set);

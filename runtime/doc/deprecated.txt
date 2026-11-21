@@ -63,6 +63,10 @@ VIMSCRIPT
   |nvim_get_context()| and |nvim_load_context()| instead.
 • *rpcnotify()*		Use |vim.rpcnotify()| instead.
 • *rpcrequest()*	Use |vim.rpcrequest()| instead.
+                                                                *preinserted()*
+• preinserted(), |complete_info()| "preinserted_text": they report only what
+  "longest" inserts.  The "preinsert" preview is an extmark in the
+  "nvim.completion.preinsert" namespace.
 
 ------------------------------------------------------------------------------
 DEPRECATED IN 0.12					*deprecated-0.12*

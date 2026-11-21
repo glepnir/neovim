@@ -209,6 +209,9 @@ M.vars = {
         cmdtype          Type of cmdline, |cmdline-char|.
         col              Column count of popup menu on |CompleteChanged|,
                          relative to screen.
+        complete_leader  Text the matches are filtered by, i.e. what
+                         was typed since the completion started; the
+                         line may show a match in its place.
         complete_type    See |complete_info_mode|
         complete_word    The selected word, or empty if completion
                          was abandoned/discarded.

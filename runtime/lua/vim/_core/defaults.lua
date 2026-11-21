@@ -1165,3 +1165,14 @@ do
     vim.o.grepformat = '%f:%l:%c:%m'
   end
 end
+
+do
+  -- Loaded only once 'completeopt' has "preinsert".
+  nvim_on('CompleteChanged', vim.api.nvim_create_augroup('nvim.preinsert'), {
+    desc = "Draw the 'preinsert' preview",
+  }, function(ev)
+    if vim.o.completeopt:find('preinsert', 1, true) then
+      require('vim._core.completion.preinsert').draw(ev)
+    end
+  end)
+end

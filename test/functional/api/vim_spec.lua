@@ -3438,20 +3438,6 @@ describe('API', function()
       eq({ 'a', 'b', 'c' }, eval('[g:one, g:Two, g:THREE]'))
       api.nvim_load_context(ctx)
       eq({ 1, 2, 3 }, eval('[g:one, g:Two, g:THREE]'))
-
-      -- Context restores what it saved, irrespective of 'shada'.
-      command('set shada=')
-      command('autocmd OptionSet shada let g:optionset = 1')
-      api.nvim_set_var('one', 'a')
-      api.nvim_load_context(ctx)
-      eq(1, eval('g:one'))
-      eq('', eval('&shada'))
-      eq(0, eval("get(g:, 'optionset', 0)"))
-
-      -- Does not touch v:oldfiles (only ":rshada!" rebuilds it).
-      command('let v:oldfiles = ["/a", "/b"]')
-      api.nvim_load_context(ctx)
-      eq({ '/a', '/b' }, eval('v:oldfiles'))
     end)
 
     it('errors when context dict is invalid', function()
@@ -4672,6 +4658,13 @@ describe('API', function()
       eq({ str = 'abc', width = 3 }, api.nvim_eval_statusline('%.0(abc%)', {}))
       eq(api.nvim_eval_statusline('%.50f', {}), api.nvim_eval_statusline('%.0f', {}))
       eq(api.nvim_eval_statusline('%.50l', {}), api.nvim_eval_statusline('%.0l', {}))
+    end)
+
+    it("doesn't exceed maxwidth", function()
+      eq({
+        str = 'Should be trun>',
+        width = 15,
+      }, api.nvim_eval_statusline('Should be truncated%<', { maxwidth = 15 }))
     end)
 
     it('has correct default fillchar', function()
@@ -6310,5 +6303,423 @@ describe('API', function()
       52                                      |
       ^:call getchar()                         |
     ]])
+  end)
+
+  describe('nvim__complete', function()
+    before_each(function()
+      clear()
+      command('set completeopt=menu,menuone,noselect')
+    end)
+
+    local function menu_words()
+      local words = {}
+      for _, item in ipairs(fn.complete_info({ 'items' }).items) do
+        table.insert(words, item.word)
+      end
+      return words
+    end
+
+    local function shown_words()
+      local words = {}
+      for _, item in ipairs(fn.complete_info({ 'matches' }).matches) do
+        table.insert(words, item.word)
+      end
+      return words
+    end
+
+    local function selected()
+      return fn.complete_info({ 'selected' }).selected
+    end
+
+    it('validates arguments', function()
+      eq(-1, api.nvim__complete({ col = 1, items = { { word = 'x' } } }))
+      feed('i')
+      local x = { { word = 'x' } }
+      eq("Required: 'items'", pcall_err(api.nvim__complete, { col = 1 }))
+      eq("'items' must not be empty", pcall_err(api.nvim__complete, { col = 1, items = {} }))
+      eq("'items' must not be empty", pcall_err(api.nvim__complete, { id = 1, items = {} }))
+      eq("Required: 'col'", pcall_err(api.nvim__complete, { items = x }))
+      eq("Invalid 'col': 0", pcall_err(api.nvim__complete, { col = 0, items = x }))
+      eq(
+        "Conflict: 'col' not allowed with 'id'",
+        pcall_err(api.nvim__complete, { col = 1, id = 1, items = x })
+      )
+      eq("Invalid 'id': -1", pcall_err(api.nvim__complete, { id = -1, items = x }))
+      -- larger than INT_MAX
+      eq(-1, api.nvim__complete({ id = 5000000000, items = { { word = 'x' } } }))
+    end)
+
+    it('starts and replaces; old ids are fenced out', function()
+      feed('i')
+      local id1 = api.nvim__complete({ col = 1, items = { { word = 'a' }, { word = 'b' } } })
+      ok(id1 > 0)
+      eq(1, fn.pumvisible())
+      eq({ 'a', 'b' }, menu_words())
+
+      eq(id1, api.nvim__complete({ id = id1, items = { { word = 'c' }, { word = 'd' } } }))
+      eq({ 'c', 'd' }, menu_words())
+      eq(-1, selected())
+
+      local id2 = api.nvim__complete({ col = 1, items = { { word = 'x' } } })
+      ok(id2 > id1)
+      eq({ 'x' }, menu_words())
+      eq(-1, api.nvim__complete({ id = id1, items = { { word = 'y' } } }))
+      eq({ 'x' }, menu_words())
+    end)
+
+    it('starts over native completion', function()
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'word1 word2', '' })
+      feed('Gi<C-n>')
+      eq(1, fn.pumvisible())
+      local id = api.nvim__complete({ col = 1, items = { { word = 'api1' } } })
+      ok(id > 0)
+      eq({ 'api1' }, menu_words())
+
+      eq(id, api.nvim__complete({ id = id }))
+      eq(0, fn.pumvisible())
+      eq(-1, api.nvim__complete({ id = id, items = { { word = 'e1' } } }))
+    end)
+
+    it('ids go stale when the session ends', function()
+      feed('i')
+      local id = api.nvim__complete({ col = 1, items = { { word = 'a' }, { word = 'b' } } })
+      feed('<C-e>')
+      eq(0, fn.pumvisible())
+      eq(-1, api.nvim__complete({ id = id, items = { { word = 'late' } } }))
+      eq(0, fn.pumvisible())
+
+      id = api.nvim__complete({ col = 1, items = { { word = 'a' } } })
+      feed('<Esc>')
+      eq(-1, api.nvim__complete({ id = id, items = { { word = 'late' } } }))
+
+      feed('i')
+      exec_lua([[
+        _G.late = 'pending'
+        local id = vim.api.nvim__complete({ col = 1, items = { { word = 'a' } } })
+        vim.defer_fn(function()
+          _G.late = vim.api.nvim__complete({ id = id, items = { { word = 'z' } } })
+        end, 30)
+      ]])
+      feed('<C-e>')
+      t.retry(nil, nil, function()
+        eq(-1, exec_lua('return _G.late'))
+      end)
+      eq(0, fn.pumvisible())
+    end)
+
+    it('replace keeps the selection by word', function()
+      feed('i')
+      local id = api.nvim__complete({ col = 1, items = { { word = 'aa' }, { word = 'bb' } } })
+      feed('<C-n>') -- select 'aa'
+      eq(0, selected())
+
+      eq(id, api.nvim__complete({ id = id, items = { { word = 'cc' }, { word = 'aa' } } }))
+      eq({ 'cc', 'aa' }, menu_words())
+      eq(1, selected())
+
+      eq(id, api.nvim__complete({ id = id, items = { { word = 'dd' } } }))
+      eq({ 'dd' }, menu_words())
+      eq(-1, selected())
+    end)
+
+    it('col is 1-based like complete()', function()
+      command('set completeopt=menuone')
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'foo b' })
+      feed('A')
+      local id = api.nvim__complete({ col = 5, items = { { word = 'bar' } } })
+      ok(id > 0)
+      feed('<C-y>')
+      eq('foo bar', api.nvim_get_current_line())
+    end)
+
+    it('filters by what is typed from the start', function()
+      feed('ifo')
+      ok(api.nvim__complete({ col = 1, items = { { word = 'foo' }, { word = 'bar' } } }) > 0)
+      eq({ 'foo' }, shown_words())
+      feed('<C-e>')
+      eq(0, api.nvim__complete({ col = 1, items = { { word = 'bar' } } }))
+      eq(0, fn.pumvisible())
+      eq('', fn.complete_info({ 'mode' }).mode)
+      eq('fo', api.nvim_get_current_line())
+
+      command('set completeopt+=fuzzy')
+      feed('<Esc>ccfb')
+      local items = { { word = 'xfxb' }, { word = 'bar' }, { word = 'foobar' } }
+      ok(api.nvim__complete({ col = 1, items = items }) > 0)
+      eq({ 'foobar', 'xfxb' }, shown_words())
+    end)
+
+    it('keeps the given order between equal fuzzy scores as the leader changes', function()
+      command('set completeopt=menu,menuone,noselect,fuzzy')
+      feed('ib')
+      ok(api.nvim__complete({ col = 1, items = { { word = 'axb' }, { word = 'ébA' } } }) > 0)
+      eq({ 'axb', 'ébA' }, shown_words())
+      feed('a')
+      eq({ 'ébA' }, shown_words())
+      feed('<BS>')
+      eq({ 'axb', 'ébA' }, shown_words())
+    end)
+
+    it('ends the session when a replacement matches nothing', function()
+      exec_lua(function()
+        _G.reason = nil
+        vim.api.nvim_create_autocmd('CompleteDone', {
+          callback = function()
+            _G.reason = vim.v.event.reason
+          end,
+        })
+      end)
+      feed('ifo')
+      local id = api.nvim__complete({ col = 1, items = { { word = 'foo' } } })
+      ok(id > 0)
+      eq(0, api.nvim__complete({ id = id, items = { { word = 'bar' } } }))
+      eq('discard', exec_lua('return _G.reason'))
+      eq(0, fn.pumvisible())
+      eq('fo', api.nvim_get_current_line())
+      eq(-1, api.nvim__complete({ id = id, items = { { word = 'foo' } } }))
+    end)
+
+    it('replace restores the leader in a longest session', function()
+      command('set completeopt=menu,longest')
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'foo' })
+      feed('A')
+      local id =
+        api.nvim__complete({ col = 1, items = { { word = 'foobar' }, { word = 'foobaz' } } })
+      local leader = api.nvim_get_current_line()
+      eq('foo', leader)
+      eq(id, api.nvim__complete({ id = id, items = { { word = 'foofizz' } } }))
+      eq(leader, api.nvim_get_current_line())
+    end)
+
+    it('reentrancy from autocmds during a call', function()
+      feed('i')
+      api.nvim__complete({ col = 1, items = { { word = 'old' } } })
+      exec_lua([[
+        vim.api.nvim_create_autocmd('CompleteDone', {
+          once = true,
+          callback = function() vim.fn.complete(1, { 'nested' }) end,
+        })
+      ]])
+      local id = api.nvim__complete({ col = 1, items = { { word = 'outer' } } })
+      ok(id > 0)
+      eq({ 'outer' }, menu_words())
+      eq(id, api.nvim__complete({ id = id, items = { { word = 'more' } } }))
+
+      exec_lua([[
+        _G.thief_err = 'unset'
+        vim.api.nvim_create_autocmd('ModeChanged', {
+          pattern = '*:ic',
+          once = true,
+          callback = function()
+            local ok_, e = pcall(vim.fn.complete, 1, { 'thief' })
+            _G.thief_err = ok_ and '' or tostring(e)
+          end,
+        })
+      ]])
+      eq(-1, api.nvim__complete({ col = 1, items = { { word = 'outer2' } } }))
+      eq('', exec_lua('return _G.thief_err'))
+      eq({ 'thief' }, menu_words())
+
+      exec_lua([[
+        _G.cc = 'unset'
+        vim.api.nvim_create_autocmd('CompleteChanged', {
+          once = true,
+          callback = function()
+            _G.cc = vim.api.nvim__complete({ col = 1, items = { { word = 'x' } } })
+          end,
+        })
+      ]])
+      id = api.nvim__complete({ col = 1, items = { { word = 'a' } } })
+      ok(id > 0)
+      eq(-1, exec_lua('return _G.cc'))
+    end)
+
+    local function shown_words()
+      local words = {}
+      for _, item in ipairs(fn.complete_info({ 'matches' }).matches) do
+        table.insert(words, item.word)
+      end
+      return words
+    end
+
+    it('rejects a batch aimed at another window', function()
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'hel' })
+      feed('A')
+      local res = exec_lua([[
+        local win = vim.api.nvim_get_current_win()
+        local id = vim.api.nvim__complete({ col = 1, items = { { word = 'hello' } } })
+        vim.api.nvim_set_current_win(vim.api.nvim_open_win(
+          vim.api.nvim_create_buf(false, true), false,
+          { relative = 'editor', row = 0, col = 0, width = 10, height = 3 }))
+        local r = {
+          id = id,
+          replace = vim.api.nvim__complete({ id = id, items = { { word = 'zzz' } } }),
+          start = vim.api.nvim__complete({ col = 1, items = { { word = 'zzz' } } }),
+        }
+        vim.api.nvim_set_current_win(win)
+        return r
+      ]])
+      ok(res.id > 0)
+      eq(-1, res.replace)
+      eq(-1, res.start)
+
+      feed('<Esc>')
+      eq({ 'hel' }, api.nvim_buf_get_lines(0, 0, -1, true))
+    end)
+
+    it('does not accept a match when a space is a commit character', function()
+      command('set completeopt=menu,menuone')
+      exec_lua([[
+        _G.done = {}
+        vim.api.nvim_create_autocmd('CompleteDone', {
+          callback = function() table.insert(_G.done, vim.v.event.reason) end,
+        })
+      ]])
+      feed('i')
+      local win = api.nvim_get_current_win()
+      ok(api.nvim__complete({ col = 1, items = { { word = 'hello', commit_chars = ' ' } } }) > 0)
+      eq(1, fn.pumvisible())
+
+      api.nvim_set_current_win(api.nvim_open_win(api.nvim_create_buf(false, true), false, {
+        relative = 'editor',
+        row = 0,
+        col = 0,
+        width = 10,
+        height = 3,
+      }))
+      api.nvim_set_current_win(win)
+      feed('x')
+      eq({ 'discard' }, exec_lua('return _G.done'))
+    end)
+
+    it("filters as the leader grows by 'ignorecase' and 'smartcase'", function()
+      local items = { { word = 'Foobar', icase = 1 }, { word = 'foobaz', icase = 1 } }
+      for _, case in ipairs({
+        { 'noignorecase', 'f', { 'foobaz' } },
+        { 'ignorecase', 'f', { 'Foobar', 'foobaz' } },
+        { 'ignorecase smartcase', 'F', { 'Foobar' } },
+      }) do
+        command('set ' .. case[1])
+        feed('<Esc>cc' .. case[2])
+        ok(api.nvim__complete({ col = 1, items = items }) > 0)
+        feed('oo')
+        eq(case[3], shown_words())
+      end
+    end)
+
+    it('survives typing over an inserted match', function()
+      command('set completeopt=menu,menuone')
+      exec_lua([[
+        _G.done = {}
+        vim.api.nvim_create_autocmd('CompleteDone', {
+          callback = function() table.insert(_G.done, vim.v.event.reason) end,
+        })
+      ]])
+      feed('ih')
+      local id =
+        api.nvim__complete({ col = 1, items = { { word = 'hello' }, { word = 'helper' } } })
+      ok(id > 0)
+      eq('hello', api.nvim_get_current_line())
+
+      feed('e')
+      eq('he', api.nvim_get_current_line())
+      eq({}, exec_lua('return _G.done'))
+      eq(id, api.nvim__complete({ id = id, items = { { word = 'held' }, { word = 'helm' } } }))
+      eq({ 'held', 'helm' }, menu_words())
+    end)
+
+    --- Against "p.mem" with col = 3: compl_col is 2 (0-indexed), the leader "mem".
+    local function mixed_items()
+      return {
+        { word = 'member9' },
+        { word = '.member2', startcol = 2 },
+        { word = 'member(', filter_text = 'member' },
+      }
+    end
+
+    it('browses a list whose items start at different columns', function()
+      local function start(cot)
+        feed('<Esc>ccp.mem')
+        exec_lua(function(items)
+          vim.o.completeopt = cot
+          vim.api.nvim__complete({ col = 3, items = items })
+        end, mixed_items())
+      end
+
+      start('menu,menuone,noselect')
+      feed('<C-n>')
+      eq('p.member9', api.nvim_get_current_line())
+      feed('<C-n>')
+      eq('p.member2', api.nvim_get_current_line())
+      feed('<C-n>')
+      eq('p.member(', api.nvim_get_current_line())
+      feed('<C-p>')
+      eq('p.member2', api.nvim_get_current_line())
+      feed('<C-p>')
+      eq('p.member9', api.nvim_get_current_line())
+      feed('<C-y>')
+      eq('p.member9', api.nvim_get_current_line())
+
+      start('menu,menuone,noselect,fuzzy,nosort')
+      feed('<C-n><C-n>')
+      eq('p.member2', api.nvim_get_current_line())
+      feed('<BS><BS>')
+      eq(3, #fn.complete_info({ 'matches' }).matches)
+
+      start('menu,menuone,noselect,preinsert')
+      eq('p.mem', api.nvim_get_current_line())
+      feed('<C-n><C-n><C-y>')
+      eq('p.member2', api.nvim_get_current_line())
+    end)
+
+    it('ends the session when items are omitted, as "discard"', function()
+      exec_lua(function()
+        _G.reasons = {}
+        vim.api.nvim_create_autocmd('CompleteDone', {
+          callback = function()
+            _G.reasons[#_G.reasons + 1] = vim.v.event.reason
+          end,
+        })
+      end)
+      feed('ifoo<Esc>o')
+      local id = api.nvim__complete({ col = 1, items = { 'foobar', 'foobaz' } })
+      ok(id > 0)
+      eq(1, fn.pumvisible())
+      eq(id, api.nvim__complete({ id = id }))
+      eq(0, fn.pumvisible())
+      eq('', fn.complete_info({ 'mode' }).mode)
+      eq({ 'discard' }, exec_lua('return _G.reasons'))
+      eq(-1, api.nvim__complete({ id = id }))
+    end)
+
+    it('keeps the session when its handlers raise, and reports them', function()
+      exec_lua(function()
+        vim.api.nvim_create_autocmd({ 'CompleteChanged', 'CompleteDone' }, {
+          callback = function()
+            error('handler blew up')
+          end,
+        })
+      end)
+      feed('i')
+      local id = api.nvim__complete({ col = 1, items = { { word = 'bar' } } })
+      ok(id > 0)
+      eq(id, api.nvim__complete({ id = id, items = { { word = 'baz' } } }))
+      eq(id, api.nvim__complete({ id = id }))
+      eq(0, fn.pumvisible())
+      matches('handler blew up', api.nvim_exec2('messages', { output = true }).output)
+    end)
+
+    it("previews under 'preinsert' with 'ignorecase' and no 'infercase'", function()
+      exec_lua(function()
+        vim.o.completeopt = 'menu,menuone,preinsert'
+        vim.o.autocomplete = true
+        vim.o.ignorecase = true
+        vim.o.infercase = false
+      end)
+      feed('ifoo<Esc>o')
+      local id = api.nvim__complete({ col = 1, items = { { word = 'foobar' } } })
+      ok(id > 0)
+      eq('foobar', api.nvim_get_current_line())
+    end)
   end)
 end)

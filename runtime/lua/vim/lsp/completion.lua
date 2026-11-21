@@ -39,6 +39,10 @@
 --- vim.lsp.completion.enable(true, client_id, bufnr, { commit_characters = false })
 --- ```
 
+-- A round is dropped between a keystroke and the engine by: the debounce
+-- timer, a stale `generation`, Session.peek() no longer returning it, the
+-- context re-read at publish time, or Session:cancel_request().
+
 local M = {}
 
 local api = vim.api
@@ -46,77 +50,44 @@ local nvim_on = require('vim._core.util').nvim_on
 local lsp = vim.lsp
 local protocol = lsp.protocol
 
-local rtt_ms = 50.0
 local ns_to_ms = 0.000001
 
 --- @alias vim.lsp.CompletionResult lsp.CompletionList | lsp.CompletionItem[]
 
--- TODO(mariasolos): Remove this declaration once we figure out a better way to handle
--- literal/anonymous types (see https://github.com/neovim/neovim/pull/27542/files#r1495259331).
---- @nodoc
---- @class lsp.ItemDefaults
---- @field commitCharacters string[]?
---- @field editRange lsp.Range | { insert: lsp.Range, replace: lsp.Range } | nil
---- @field insertTextFormat lsp.InsertTextFormat?
---- @field insertTextMode lsp.InsertTextMode?
---- @field data any
-
+--- Per-buffer configuration, owned by enable()/disable().
+---
 --- @nodoc
 --- @class vim.lsp.completion.BufHandle
 --- @field clients table<integer, vim.lsp.Client>
 --- @field triggers table<string, vim.lsp.Client[]>
+--- @field identifier table<integer, vim.lsp.Client> Clients asked while an
+--- identifier is being typed, by id.
+--- @field rank? table<integer, integer> Order between clients whose items score
+--- alike, by id.  Absent ids come after the rest.
+--- @field secondary? table<integer, true> Clients whose items are left out
+--- while another client offers any, by id.
+--- @field autotrigger? table<integer, true> Clients asked on their trigger
+--- characters, by id.
+--- @field listening? true Whether InsertCharPre is registered.
 --- @field convert? fun(item: lsp.CompletionItem): table
+--- @field cmp? fun(a: table, b: table): boolean
+--- @field commit_characters? boolean
+--- @field insert_mode? 'insert'|'replace'
 
 --- @type table<integer, vim.lsp.completion.BufHandle>
 local buf_handles = {}
 
 --- @nodoc
---- @class vim.lsp.completion.Context
-local Context = {
-  cursor = nil, --- @type [integer, integer]?
-  last_request_time = nil, --- @type integer?
-  pending_requests = {}, --- @type function[]
-  isIncomplete = false,
-  -- Handles "completionItem/resolve".
-  resolve_handler = nil, --- @type CompletionResolver?
-}
+--- @class vim.lsp.completion.Response
+--- @field err? lsp.ResponseError
+--- @field result? vim.lsp.CompletionResult
+--- @field position? lsp.Position where it was asked, which the edit ranges refer to
 
---- @nodoc
-function Context:cancel_pending()
-  for _, cancel in ipairs(self.pending_requests) do
-    cancel()
-  end
-
-  self.pending_requests = {}
-end
-
---- @nodoc
-function Context:reset()
-  -- Note that the cursor isn't reset here, it needs to survive a `CompleteDone` event.
-  self.isIncomplete = false
-  self.last_request_time = nil
-  self:cancel_pending()
-  if self.resolve_handler then
-    self.resolve_handler:cleanup()
-    self.resolve_handler = nil
-  end
-end
-
---- @type uv.uv_timer_t?
-local completion_timer = nil
-
---- @return uv.uv_timer_t
-local function new_timer()
-  return (assert(vim.uv.new_timer()))
-end
-
-local function reset_timer()
-  if completion_timer then
-    completion_timer:stop()
-    completion_timer:close()
-  end
-
-  completion_timer = nil
+--- @param flag string
+--- @return boolean
+local function has_completeopt(flag)
+  -- 'completeopt' is global-local: vim.o gives what the engine reads.
+  return vim.list_contains(vim.split(vim.o.completeopt, ',', { trimempty = true }), flag)
 end
 
 --- @param window integer
@@ -139,7 +110,29 @@ local function exp_avg(window, warmup)
     return value
   end
 end
-local compute_new_average = exp_avg(10, 10)
+--- Round-trip time per set of clients: a round waits for its slowest, and the
+--- in-process server answers far sooner than a language server.
+--- @type table<string, { rtt_ms: number, average: fun(sample: number): number }>
+local rtt = {}
+
+--- @param ids integer[]
+--- @return { rtt_ms: number, average: fun(sample: number): number }
+local function rtt_for_ids(ids)
+  table.sort(ids)
+  local key = table.concat(ids, ',')
+  rtt[key] = rtt[key] or { rtt_ms = 50.0, average = exp_avg(10, 10) }
+  return rtt[key]
+end
+
+--- @param clients table<integer, vim.lsp.Client> # keys != client_id
+--- @return { rtt_ms: number, average: fun(sample: number): number }
+local function rtt_for(clients)
+  local ids = {} --- @type integer[]
+  for _, c in pairs(clients) do
+    ids[#ids + 1] = c.id
+  end
+  return rtt_for_ids(ids)
+end
 
 --- Calculates the adaptive debounce time based on the elapsed time since the last request.
 ---
@@ -154,10 +147,21 @@ local function adaptive_debounce(last_request_time, current_rtt_ms)
   return math.max((ms_since_request - current_rtt_ms) * -1, 0)
 end
 
---- @param flag string
---- @return boolean
-local function has_completeopt(flag)
-  return vim.list_contains(vim.opt.completeopt:get() --[[@as string[] ]], flag)
+--- @type uv.uv_timer_t?
+local completion_timer = nil
+
+local function reset_timer()
+  if completion_timer then
+    completion_timer:stop()
+    completion_timer:close()
+  end
+
+  completion_timer = nil
+end
+
+--- @return uv.uv_timer_t
+local function new_timer()
+  return (assert(vim.uv.new_timer()))
 end
 
 --- @param s string?
@@ -184,15 +188,12 @@ local function apply_snippet(item)
   end
 end
 
---- @param item lsp.CompletionItem
---- @param word string
---- @param prefix string
---- @param match fun(word: string, prefix: string): boolean
-local function fallback_filtertext(item, word, prefix, match)
-  if item.filterText and not match(word, prefix) and match(item.filterText, prefix) then
-    return item.filterText
-  end
-  return word
+--- Up to the first line break, which most texts do not have.
+--- @param text string
+--- @return string
+local function first_line(text)
+  local eol = text:find('[\r\n]')
+  return eol and text:sub(1, eol - 1) or text
 end
 
 --- Returns text that should be inserted when a selecting completion item. The
@@ -201,53 +202,40 @@ end
 --- See https://microsoft.github.io/language-server-protocol/specifications/specification-current/#textDocument_completion
 ---
 --- @param item lsp.CompletionItem
---- @param prefix string
---- @param match fun(text: string, prefix: string):boolean
---- @return string
-local function get_completion_word(item, prefix, match)
+--- @return string word
+--- @return string text What the item puts in the buffer, snippets expanded.
+local function get_completion_word(item)
   if item.insertTextFormat == protocol.InsertTextFormat.Snippet then
-    if item.textEdit or (item.insertText and item.insertText ~= '') then
-      -- Use label instead of text if text has different starting characters.
-      -- label is used as abbr (=displayed), but word is used for filtering
-      -- This is required for things like postfix completion.
-      -- E.g. in lua:
-      --
-      --    local f = {}
-      --    f@|
-      --      ▲
-      --      └─ cursor
-      --
-      --    item.textEdit.newText: table.insert(f, $0)
-      --    label: insert
-      --
-      -- Typing `i` would remove the candidate because newText starts with `t`.
+    if item.textEdit or nonempty(item.insertText) then
       local text = parse_snippet(
         (item.textEdit and item.textEdit.newText) or assert(nonempty(item.insertText))
       )
+      if #text < #item.label then
+        return vim.fn.matchstr(text, '\\k*'), text
+      end
       local filter_text = nonempty(item.filterText)
-      local word = #text < #item.label and vim.fn.matchstr(text, '\\k*')
-        or (filter_text and vim.fn.match(item.label, '^\\k') == -1 and filter_text or item.label)
-      return fallback_filtertext(item, word, prefix, match)
+      if filter_text and vim.fn.match(item.label, '^\\k') == -1 then
+        return filter_text, text
+      end
+      return item.label, text
     else
-      return item.label
+      return item.label, item.label
     end
   elseif item.textEdit then
-    local word = item.textEdit.newText
-    word = string.gsub(word, '\r\n?', '\n')
-    word = word:match('([^\n]*)') or word
-    return fallback_filtertext(item, word, prefix, match)
-  elseif item.insertText and item.insertText ~= '' then
-    local word = string.gsub(item.insertText, '\r\n?', '\n')
-    word = word:match('([^\n]*)') or word
-    return fallback_filtertext(item, word, prefix, match)
+    local word = first_line(item.textEdit.newText)
+    return word, word
+  elseif nonempty(item.insertText) then
+    -- First line only, as for textEdit: every column is measured on compl_lnum.
+    local text = item.insertText --[[@as string]]
+    return first_line(text), text
   end
-  return item.label
+  return item.label, item.label
 end
 
 --- Applies the given defaults to the completion item, modifying it in place.
 ---
 --- @param item lsp.CompletionItem
---- @param defaults lsp.ItemDefaults?
+--- @param defaults lsp.CompletionItemDefaults?
 --- @param apply_kind lsp.CompletionItemApplyKinds?
 local function apply_defaults(item, defaults, apply_kind)
   if not defaults then
@@ -282,22 +270,40 @@ local function apply_defaults(item, defaults, apply_kind)
       or item.textEditText
       or nonempty(item.insertText)
       or item.label
-    if defaults.editRange.start then
-      textEdit.range = textEdit.range or defaults.editRange
-    elseif defaults.editRange.insert then
-      textEdit.insert = defaults.editRange.insert
-      textEdit.replace = defaults.editRange.replace
+    -- Only for an item without a range of its own.
+    if not (textEdit.range or textEdit.insert) then
+      if defaults.editRange.start then
+        textEdit.range = defaults.editRange
+      elseif defaults.editRange.insert then
+        textEdit.insert = defaults.editRange.insert
+        textEdit.replace = defaults.editRange.replace
+      end
     end
   end
 end
 
+--- Completion options for a buffer, fields from a dynamic registration.
+---
+--- @param client vim.lsp.Client
+--- @param bufnr integer
+--- @return lsp.CompletionOptions
+local function completion_options(client, bufnr)
+  local static = client.server_capabilities.completionProvider or {}
+  for _, reg in ipairs(client:_get_registrations('completionProvider', bufnr) or {}) do
+    local opts = reg.registerOptions
+    if type(opts) == 'table' then
+      return vim.tbl_extend('keep', opts, static)
+    end
+  end
+  return static
+end
+
 --- @param result vim.lsp.CompletionResult
 --- @return lsp.CompletionItem[]
-local function get_items(result)
+function M._get_items(result)
   if result.items then
     -- When we have a list, apply the defaults and return an array of items.
     for _, item in ipairs(result.items) do
-      ---@diagnostic disable-next-line: param-type-mismatch
       apply_defaults(item, result.itemDefaults, result.applyKind)
     end
     result.itemDefaults = nil
@@ -328,26 +334,6 @@ local function get_doc(item)
 
   vim.notify('invalid documentation value: ' .. vim.inspect(doc), vim.log.levels.WARN)
   return '', default_kind
-end
-
----@return fun(value: string, prefix: string): boolean, integer?
-local function item_matcher()
-  local fuzzy = has_completeopt('fuzzy')
-  local ignorecase, smartcase = vim.o.ignorecase, vim.o.smartcase
-  return function(value, prefix)
-    if prefix == '' then
-      return true, nil
-    end
-    if fuzzy then
-      local score = vim.fn.matchfuzzypos({ value }, prefix)[3] ---@type table
-      return #score > 0, score[1]
-    end
-
-    if ignorecase and (not smartcase or not prefix:find('%u')) then
-      return vim.startswith(value:lower(), prefix:lower()), nil
-    end
-    return vim.startswith(value, prefix), nil
-  end
 end
 
 --- Generate kind text for completion color items
@@ -460,97 +446,191 @@ local function commit_chars_str(chars)
   return table.concat(result)
 end
 
---- @param item lsp.CompletionItem
---- @param lnum integer
---- @return integer?
-local function edit_start_char(item, lnum)
-  local edit = item.textEdit
-  if not edit then
-    return nil
-  elseif edit.range and edit.range.start.line == lnum then
-    return edit.range.start.character
-  elseif edit.insert and edit.insert.start.line == lnum then
-    return edit.insert.start.character
-  end
-end
-
---- Completion options for a buffer, fields from a dynamic registration.
+--- Where an item without a text edit starts: `/**` offered on `/`. #30905
 ---
---- @param client vim.lsp.Client
---- @param bufnr integer
---- @return lsp.CompletionOptions
-local function completion_options(client, bufnr)
-  local static = client.server_capabilities.completionProvider or {}
-  for _, reg in ipairs(client:_get_registrations('completionProvider', bufnr) or {}) do
-    local opts = reg.registerOptions
-    if type(opts) == 'table' then
-      return vim.tbl_extend('keep', opts, static)
+--- @param text string what the item puts in the buffer
+--- @param line string
+--- @param compl_col integer 0-indexed session column
+--- @param cursor_col integer 0-indexed
+--- @return integer
+local function infer_start_col(text, line, compl_col, cursor_col)
+  -- A guess (#30905), so the first character is checked before scanning; "-1"
+  -- or ".5" can still be read as reaching back.
+  local first = text:sub(1, 1)
+  local reach = line:sub(math.max(1, cursor_col - #text + 1), compl_col)
+  if first == '' or reach:find(first, 1, true) == nil then
+    return compl_col
+  end
+  for s = math.max(0, cursor_col - #text), compl_col - 1 do
+    if vim.startswith(text, line:sub(s + 1, cursor_col)) then
+      return s
     end
   end
-  return static
+  return compl_col
+end
+
+--- The column an item replaces from, or nil when it starts at the word boundary.
+---
+--- @param item lsp.CompletionItem
+--- @param line string?
+--- @param lnum integer? 0-indexed
+--- @param encoding? 'utf-8'|'utf-16'|'utf-32'
+--- @param compl_col integer 0-indexed session column
+--- @param cursor_col integer 0-indexed
+--- @param text string? what the item puts in the buffer, snippets expanded
+--- @return integer?
+local function item_edit_start(item, line, lnum, encoding, compl_col, cursor_col, text)
+  if line and lnum and encoding and item.textEdit then
+    local range = item.textEdit.range or item.textEdit.insert
+    -- Both ends on this line: a range leaving it has no column to measure.
+    if range and range.start.line == lnum and range['end'].line == lnum then
+      return vim.str_byteindex(line, encoding, range.start.character, false)
+    end
+    return nil
+  end
+  if line and compl_col > 0 and text then
+    local inferred = infer_start_col(text, line, compl_col, cursor_col)
+    if inferred < compl_col then
+      return inferred
+    end
+  end
+  return nil
+end
+
+--- @nodoc
+--- @class vim.lsp.completion.Prepared
+--- @field item lsp.CompletionItem
+--- @field word string what accepting it inserts
+--- @field start integer? 0-indexed column it replaces from, when it has one
+--- @field prefix string what it is matched against: the line from that column, or
+--- from the session column when it starts in front, to the cursor
+--- @field filter string what it is filtered by
+--- @field rewrite integer? 0-indexed column the edit is applied from on accept,
+--- when the engine cannot start the word there
+
+--- The "values" the engine may show for "prefix": by prefix ignoring case, or with
+--- "fuzzy" by matchfuzzy().  Non-ASCII text, which lower() cannot fold, is kept.
+--- @param values string[]
+--- @param prefix string
+--- @return table<string, true>
+local function may_show(values, prefix)
+  local shown = {} --- @type table<string, true>
+  local multibyte = prefix:find('[\128-\255]') ~= nil
+  local lower = prefix:lower()
+  for _, value in ipairs(values) do
+    local head = value:sub(1, #prefix)
+    if multibyte or head:lower() == lower or head:find('[\128-\255]') then
+      shown[value] = true
+    end
+  end
+  if has_completeopt('fuzzy') then
+    local matched = vim.fn.matchfuzzy(values, prefix) --- @type string[]
+    for _, value in ipairs(matched) do
+      shown[value] = true
+    end
+  end
+  return shown
+end
+
+--- Resolves the item defaults and works out where each item replaces from.
+---
+--- @param result vim.lsp.CompletionResult
+--- @param line string?
+--- @param lnum integer? 0-indexed
+--- @param cursor_col integer 0-indexed
+--- @param compl_col integer 0-indexed session column
+--- @param encoding? 'utf-8'|'utf-16'|'utf-32'
+--- @return vim.lsp.completion.Prepared[]
+local function prepare_items(result, line, lnum, cursor_col, compl_col, encoding)
+  local out = {} --- @type vim.lsp.completion.Prepared[]
+  for _, item in ipairs(M._get_items(result)) do
+    local word, text = get_completion_word(item)
+    local start = item_edit_start(item, line, lnum, encoding, compl_col, cursor_col, text)
+
+    -- What is in front of the session column was not typed: left out of what it
+    -- is filtered by, where the spec puts it in.
+    -- The label without clangd's leading decoration.
+    local filter = nonempty(item.filterText) or (item.label:gsub('^%s+', ''))
+    local rewrite --- @type integer?
+    local keep = true
+    if line and start and start < compl_col then
+      local pad = line:sub(start + 1, compl_col)
+      local padded = filter:sub(1, #pad):lower() == pad:lower()
+      if padded then
+        filter = filter:sub(#pad + 1)
+      end
+      -- The engine keeps the text in front, so an edit changing it (`.` to `->`,
+      -- or only its case) is applied on accept and the word is what VS Code
+      -- filters by.  Not when what was typed there does not match.
+      if word:sub(1, #pad) ~= pad then
+        keep = padded or vim.fn.match(pad, [[\k]]) == -1
+        rewrite, start = start, nil
+        word = filter:gsub('^%s+', '')
+        filter = word
+      end
+    end
+    if line and start and start > compl_col then
+      -- The engine takes no item after the column: the text up to it goes in front.
+      word = line:sub(compl_col + 1, start) .. word
+      filter, rewrite, start = word, start, nil
+    end
+    local prefix = line and line:sub(compl_col + 1, cursor_col) or ''
+
+    if keep then
+      out[#out + 1] = {
+        item = item,
+        word = word,
+        start = start,
+        rewrite = rewrite,
+        prefix = prefix,
+        filter = filter,
+      }
+    end
+  end
+  return out
 end
 
 --- Turns the result of a `textDocument/completion` request into vim-compatible
 --- |complete-items|.
 ---
 --- @param result vim.lsp.CompletionResult Result of `textDocument/completion`
---- @param prefix string prefix to filter the completion items
+--- @param line string current line content
+--- @param compl_col integer 0-indexed session column
+--- @param cursor_col integer
 --- @param client_id integer? Client ID
---- @param server_start_boundary integer? server start boundary
---- @param line string? current line content
 --- @param lnum integer? 0-indexed line number
 --- @param encoding? 'utf-8'|'utf-16'|'utf-32' encoding
---- @param default_start_byte integer? 0-indexed start byte for items without an edit range
---- @return table[]
---- @see complete-items
+--- @param bufnr integer? the session's buffer; the current one when absent
+--- @return table[] # |complete-items|
+--- @return table<table, { start: integer }> # what build_view()
+--- orders them by, keyed by the item it made
 function M._lsp_to_complete_items(
   result,
-  prefix,
-  client_id,
-  server_start_boundary,
   line,
+  compl_col,
+  cursor_col,
+  client_id,
   lnum,
   encoding,
-  default_start_byte
+  bufnr
 )
-  local items = get_items(result)
-  if vim.tbl_isempty(items) then
-    return {}
+  local prepared = prepare_items(result, line, lnum, cursor_col, compl_col, encoding)
+  if vim.tbl_isempty(prepared) then
+    return {}, {}
   end
 
-  local match_item_by_value = item_matcher()
+  local candidates = {} --- @type table[]
+  --- Kept beside the items, out of the "user_data" users see; build_view() sorts by it.
+  --- @type table<table, { start: integer }>
+  local order = {}
   local popup = has_completeopt('popup')
-  ---@type fun(item: lsp.CompletionItem, item_prefix: string): boolean, integer?
-  local matches
-  if not prefix:find('%w') then
-    matches = function(_, _)
-      return true
-    end
-  else
-    ---@param item lsp.CompletionItem
-    ---@param item_prefix string text the item replaces, up to the cursor
-    matches = function(item, item_prefix)
-      local filter_text = nonempty(item.filterText)
-      if filter_text then
-        return match_item_by_value(filter_text, item_prefix)
-      end
-
-      if item.textEdit and not item.textEdit.newText then
-        -- server took care of filtering
-        return true
-      end
-
-      return match_item_by_value(item.label, item_prefix)
-    end
-  end
-
-  local candidates = {}
-  local bufnr = api.nvim_get_current_buf()
+  -- A session leaves the filtering to the engine.
+  local session = bufnr ~= nil
+  bufnr = bufnr or api.nvim_get_current_buf()
   local user_convert = vim.tbl_get(buf_handles, bufnr, 'convert')
   local user_cmp = vim.tbl_get(buf_handles, bufnr, 'cmp')
   local client = client_id and lsp.get_client_by_id(client_id)
-  local server_supports_resolve = client
-    and completion_options(client, bufnr).resolveProvider == true
+  local server_supports_resolve = client and client:supports_method('completionItem/resolve')
   local use_commit = vim.tbl_get(buf_handles, bufnr, 'commit_characters') ~= false
   local commit_support = client
     and vim.tbl_get(
@@ -564,22 +644,31 @@ function M._lsp_to_complete_items(
   local all_commit_chars = client and completion_options(client, bufnr).allCommitCharacters
   local all_commit_str = all_commit_chars and commit_chars_str(all_commit_chars) or nil
 
-  for _, item in ipairs(items) do
-    local pad, item_prefix = '', prefix
-    if server_start_boundary and line and lnum and encoding then
-      local start_char = edit_start_char(item, lnum)
-      local start_byte = start_char and vim.str_byteindex(line, encoding, start_char, false)
-        or default_start_byte
-      if start_byte and start_byte > server_start_boundary then
-        pad = line:sub(server_start_boundary + 1, start_byte)
-        item_prefix = prefix:sub(#pad + 1)
-      end
-    end
+  -- Grouped by each item's own prefix.  One without \k filters nothing; \k, not
+  -- %w, which stops at a multibyte character.
+  local by_prefix = {} --- @type table<string, string[]>
+  for _, entry in ipairs(prepared) do
+    local values = by_prefix[entry.prefix] or {}
+    by_prefix[entry.prefix] = values
+    values[#values + 1] = entry.filter
+  end
+  local shows = {} --- @type table<string, table<string, true>|false>
+  for prefix, values in pairs(session and {} or by_prefix) do
+    shows[prefix] = prefix ~= '' and vim.fn.match(prefix, [[\k]]) ~= -1 and may_show(values, prefix)
+  end
 
-    local match, score = matches(item, item_prefix)
-    if match then
-      local word = pad .. get_completion_word(item, item_prefix, match_item_by_value)
+  for _, entry in ipairs(prepared) do
+    local item = entry.item
+    local word = entry.word
+    local item_start = entry.start
+    local filter_text = entry.filter
+    local shown = shows[entry.prefix]
 
+    -- Not a blank row that would insert nothing, nor one the menu cannot show.
+    if
+      word ~= ''
+      and (not shown or shown[filter_text] or (item.textEdit and not item.textEdit.newText))
+    then
       local hl_group = ''
       if
         ---@diagnostic disable-next-line: deprecated
@@ -599,8 +688,22 @@ function M._lsp_to_complete_items(
           commit_chars = all_commit_str
         end
       end
+      local user_data = {
+        nvim = {
+          lsp = {
+            completion_item = item,
+            info_kind = info_kind,
+            completion_item_needs_resolving = server_supports_resolve and not info_complete,
+            client_id = client_id,
+            rewrite_col = entry.rewrite,
+          },
+        },
+      }
       local completion_item = {
         word = word,
+        filter_text = filter_text ~= word and filter_text or nil,
+        -- Absent means the session column, which an item may start on either side of.
+        startcol = (item_start and item_start ~= compl_col) and item_start + 1 or nil,
         abbr = ('%s%s'):format(item.label, vim.tbl_get(item, 'labelDetails', 'detail') or ''),
         kind = kind,
         menu = vim.tbl_get(item, 'labelDetails', 'description') or '',
@@ -612,131 +715,208 @@ function M._lsp_to_complete_items(
         kind_hlgroup = kind_hlgroup,
         preselect = item.preselect,
         commit_chars = commit_chars,
-        user_data = {
-          nvim = {
-            lsp = {
-              completion_item = item,
-              info_kind = info_kind,
-              completion_item_needs_resolving = server_supports_resolve and not info_complete,
-              client_id = client_id,
-            },
-          },
-        },
-        _fuzzy_score = score,
+        user_data = user_data,
       }
       if user_convert then
-        completion_item = vim.tbl_extend('keep', user_convert(item), completion_item)
+        local converted = user_convert(item)
+        completion_item = vim.tbl_extend('keep', converted, completion_item)
+        -- Merged: everything downstream reads user_data.nvim.lsp, and a convert may
+        -- return its own "user_data", a table or not (|complete-items|).
+        completion_item.user_data = type(converted.user_data) == 'table'
+            and vim.tbl_deep_extend('force', converted.user_data, user_data) --[[@as { nvim: table }]]
+          or user_data
       end
-      table.insert(candidates, completion_item)
+      candidates[#candidates + 1] = completion_item
+      order[completion_item] = { start = item_start or entry.rewrite or compl_col }
     end
   end
 
   if not user_cmp then
-    --- @param a { user_data: { nvim: { lsp: { completion_item: lsp.CompletionItem } } } }
-    --- @param b { user_data: { nvim: { lsp: { completion_item: lsp.CompletionItem } } } }
-    local function compare_by_sortText_and_label(a, b)
-      local itema = a.user_data.nvim.lsp.completion_item
-      local itemb = b.user_data.nvim.lsp.completion_item
-      return (nonempty(itema.sortText) or itema.label) < (nonempty(itemb.sortText) or itemb.label)
+    -- Once per item rather than per comparison, which a sort does n log n times.
+    local sort_text = {} --- @type table<table, string>
+    for _, c in ipairs(candidates) do
+      local item = c.user_data.nvim.lsp.completion_item --- @type lsp.CompletionItem
+      sort_text[c] = nonempty(item.sortText) or item.label
     end
-
-    local use_fuzzy_sort = has_completeopt('fuzzy')
-      and not has_completeopt('nosort')
-      and not result.isIncomplete
-      and #prefix > 0
-
-    local compare_fn = use_fuzzy_sort
-        and function(a, b)
-          local score_a = a._fuzzy_score or 0
-          local score_b = b._fuzzy_score or 0
-          if score_a ~= score_b then
-            return score_a > score_b
-          end
-          return compare_by_sortText_and_label(a, b)
-        end
-      or compare_by_sortText_and_label
-
-    table.sort(candidates, compare_fn)
+    table.sort(candidates, function(a, b)
+      return sort_text[a] < sort_text[b]
+    end)
   end
-  return candidates
+
+  return candidates, order
 end
 
---- @param lnum integer 0-indexed
---- @param line string
---- @param items lsp.CompletionItem[]
---- @param encoding 'utf-8'|'utf-16'|'utf-32'
---- @return integer?
-local function adjust_start_col(lnum, line, items, encoding)
-  local min_start_char = nil
-  for _, item in pairs(items) do
-    local start_char = edit_start_char(item, lnum)
-    if start_char and (not min_start_char or start_char < min_start_char) then
-      min_start_char = start_char
-    end
+--- Read fresh each time: every column indexes `line`.
+---
+--- @nodoc
+--- @class vim.lsp.completion.LineContext
+--- @field bufnr integer
+--- @field row integer 1-indexed cursor row
+--- @field cursor_col integer 0-indexed byte column of the cursor
+--- @field line string
+--- @field word_col integer 0-indexed byte column of the `\k*$` boundary
+
+--- What a cached response describes.
+--- @param ctx vim.lsp.completion.LineContext
+--- @return string
+local function anchor_of(ctx)
+  return ('%d:%d'):format(ctx.row, ctx.word_col)
+end
+
+--- The same, for a session that is running: its column is pinned, and the line
+--- holds the shown match rather than the leader, so \k*$ would follow the match.
+--- @param session vim.lsp.completion.Session?
+--- @param ctx vim.lsp.completion.LineContext
+--- @return string
+local function session_anchor(session, ctx)
+  if session and session.col then
+    return ('%d:%d'):format(ctx.row, session.col - 1)
   end
-  if min_start_char then
-    return vim.str_byteindex(line, encoding, min_start_char, false)
-  else
-    return nil
+  return anchor_of(ctx)
+end
+
+--- @return vim.lsp.completion.LineContext
+local function line_context()
+  local row, cursor_col = unpack(api.nvim_win_get_cursor(0)) --- @type integer, integer
+  local line = api.nvim_get_current_line()
+  return {
+    bufnr = api.nvim_get_current_buf(),
+    row = row,
+    cursor_col = cursor_col,
+    line = line,
+    word_col = vim.fn.match(line:sub(1, cursor_col), '\\k*$'),
+  }
+end
+
+--- @return boolean
+local function in_insert_mode()
+  local mode = api.nvim_get_mode().mode
+  return mode == 'i' or mode == 'ic'
+end
+
+--- One per buffer: the positions it holds index that buffer.
+---
+--- @nodoc
+--- @class vim.lsp.completion.Session
+--- @field bufnr integer
+--- @field responses table<integer, { result: vim.lsp.CompletionResult, encoding: 'utf-8'|'utf-16'|'utf-32', position?: lsp.Position }>
+--- @field incomplete table<integer, true> clients that asked to be re-queried
+--- @field other_items table[]? candidates the builtin sources collected, kept
+--- only until vim._core.completion.source collects them here too
+--- @field id integer? engine session id from nvim__complete(); this and the three
+--- below describe one engine session and are set and cleared together
+--- @field col integer? 1-based column the engine session is anchored at
+--- @field leader string? leader as of the last CompleteChanged
+--- @field anchor? string Row and column the cached responses were asked from;
+--- they describe the word starting there and nothing else.
+--- @field empty_for? string Leader the cache answered nothing for: a longer one
+--- matches nothing either.  trigger() drops it.
+--- @field generation integer version of everything above; a callback carrying an
+--- older one has nothing left to publish
+--- @field cancel fun()? cancels the in-flight request round
+--- @field last_request_time integer?
+--- @field resolver CompletionResolver?
+local Session = {}
+Session.__index = Session
+
+--- @type vim.lsp.completion.Session?
+local active_session = nil
+
+--- @nodoc
+--- @param bufnr integer
+--- @return vim.lsp.completion.Session
+function Session.get(bufnr)
+  if active_session and active_session.bufnr ~= bufnr then
+    -- Only forgotten: insert_handle_key_post() cancels the other window's session.
+    active_session:reset(true)
+    active_session = nil
+  end
+  if not active_session then
+    active_session = setmetatable({
+      bufnr = bufnr,
+      responses = {},
+      incomplete = {},
+      generation = 0,
+    }, Session)
+  end
+  return active_session
+end
+
+--- @nodoc
+--- @param bufnr integer
+--- @return vim.lsp.completion.Session?
+function Session.peek(bufnr)
+  return (active_session and active_session.bufnr == bufnr) and active_session or nil
+end
+
+--- @nodoc
+--- @param bufnr integer
+--- @param stop? boolean see Session:reset()
+function Session.discard(bufnr, stop)
+  if active_session and active_session.bufnr == bufnr then
+    active_session:reset(stop)
+    active_session = nil
   end
 end
 
---- @param line string line content
---- @param lnum integer 0-indexed line number
---- @param cursor_col integer
---- @param client_id integer client ID
---- @param client_start_boundary integer 0-indexed word boundary
---- @param server_start_boundary? integer 0-indexed word boundary, based on textEdit.range.start.character
---- @param result vim.lsp.CompletionResult
---- @param encoding 'utf-8'|'utf-16'|'utf-32'
---- @return table[] matches
---- @return integer? server_start_boundary
-function M._convert_results(
-  line,
-  lnum,
-  cursor_col,
-  client_id,
-  client_start_boundary,
-  server_start_boundary,
-  result,
-  encoding
-)
-  -- Completion response items may be relative to a position different than `client_start_boundary`.
-  -- Concrete example, with lua-language-server:
-  --
-  -- require('plenary.asy|
-  --         ▲       ▲   ▲
-  --         │       │   └── cursor_pos:                     20
-  --         │       └────── client_start_boundary:          17
-  --         └────────────── textEdit.range.start.character: 9
-  --                                 .newText = 'plenary.async'
-  --                  ^^^
-  --                  prefix (We'd remove everything not starting with `asy`,
-  --                  so we'd eliminate the `plenary.async` result
-  --
-  -- `adjust_start_col` is used to prefer the language server boundary.
-  --
-  local candidates = get_items(result)
-  local curstartbyte = adjust_start_col(lnum, line, candidates, encoding)
-  if server_start_boundary == nil then
-    server_start_boundary = curstartbyte
-  elseif curstartbyte ~= nil and curstartbyte ~= server_start_boundary then
-    server_start_boundary = client_start_boundary
-  end
-  local prefix = line:sub((server_start_boundary or client_start_boundary) + 1, cursor_col)
-  local default_start_byte = curstartbyte and client_start_boundary or nil
-  local matches = M._lsp_to_complete_items(
-    result,
-    prefix,
-    client_id,
-    server_start_boundary,
-    line,
-    lnum,
-    encoding,
-    default_start_byte
-  )
+--- @nodoc
+--- @return boolean
+function Session:has_incomplete()
+  return next(self.incomplete) ~= nil
+end
 
-  return matches, server_start_boundary
+--- @nodoc
+function Session:cancel_request()
+  if self.cancel then
+    self.cancel()
+    self.cancel = nil
+  end
+end
+
+--- @nodoc
+--- Drops what a finished completion leaves behind, the session handle included.
+--- @param stop? boolean also end the engine session; not from CompleteDone,
+---                      which is the engine telling us it ended one
+function Session:reset(stop)
+  -- Nothing of the round in flight is worth publishing any more.
+  self.generation = self.generation + 1
+  self.last_request_time = nil
+  self.leader = nil
+  self.responses = {}
+  self.incomplete = {}
+  self.other_items = nil
+  self.anchor = nil
+  self.empty_for = nil
+  local id = self.id
+  self.id = nil
+  self.col = nil
+  self:cancel_request()
+  if self.resolver then
+    self.resolver:cleanup()
+    self.resolver = nil
+  end
+  if stop and id then
+    -- Last, once nothing is left to clean up: stopping fires CompleteDone.
+    api.nvim__complete({ id = id })
+  end
+end
+
+--- @nodoc
+--- Takes the candidates the builtin sources collected: nvim__complete() replaces
+--- the whole match list, so they go back in with every batch.
+function Session:capture_other_items()
+  if self.other_items then
+    return
+  end
+  local items = {} --- @type table[]
+  for _, m in ipairs(vim.fn.complete_info({ 'items' }).items) do
+    if not vim.tbl_get(m, 'user_data', 'nvim', 'lsp') then
+      -- Already past ins_compl_add()'s checks; "icase" is lost, complete_info() lacks it.
+      m.dup, m.empty = 1, 1
+      items[#items + 1] = m
+    end
+  end
+  self.other_items = items
 end
 
 -- NOTE: The reason we don't use `lsp.buf_request_all` here is because we want to filter the clients
@@ -745,30 +925,63 @@ end
 --- @param bufnr integer
 --- @param win integer
 --- @param ctx? lsp.CompletionContext
---- @param callback fun(responses: table<integer, { err: lsp.ResponseError, result: vim.lsp.CompletionResult }>)
+--- @param incomplete table<integer, true?> clients whose list for this word is incomplete
+--- @param callback fun(responses: table<integer, vim.lsp.completion.Response>)
 --- @return function # Cancellation function
-local function request(clients, bufnr, win, ctx, callback)
-  local responses = {} --- @type table<integer, { err: lsp.ResponseError, result: any }>
+local function request(clients, bufnr, win, ctx, incomplete, callback)
+  local responses = {} --- @type table<integer, { err: lsp.ResponseError?, result: any }>
   local request_ids = {} --- @type table<integer, integer>
-  local remaining_requests = vim.tbl_count(clients)
 
+  -- The documented way to opt a client out, not just for omnifunc.
+  local targets = {} --- @type vim.lsp.Client[]
   for _, client in pairs(clients) do
+    if client:supports_method('textDocument/completion', bufnr) then
+      targets[#targets + 1] = client
+    end
+  end
+
+  -- Starts at one so a synchronous answer cannot settle the round mid-loop.
+  local outstanding = 1
+  local function finish()
+    outstanding = outstanding - 1
+    if outstanding == 0 then
+      callback(responses)
+    end
+  end
+
+  for _, client in ipairs(targets) do
     local client_id = client.id
     local params = lsp.util.make_position_params(win, client.offset_encoding)
     --- @cast params lsp.CompletionParams
     params.context = ctx
+    -- Asked about this word for the first time: nothing of its is incomplete.
+    if
+      ctx
+      and ctx.triggerKind == protocol.CompletionTriggerKind.TriggerForIncompleteCompletions
+      and not incomplete[client_id]
+    then
+      params.context = { triggerKind = protocol.CompletionTriggerKind.Invoked }
+    end
+    outstanding = outstanding + 1
     local ok, request_id = client:request('textDocument/completion', params, function(err, result)
-      responses[client_id] = { err = err, result = result }
-      remaining_requests = remaining_requests - 1
-      if remaining_requests == 0 then
-        callback(responses)
-      end
+      responses[client_id] = { err = err, result = result, position = params.position }
+      finish()
     end, bufnr)
 
     if ok then
       request_ids[client_id] = request_id
+    else
+      responses[client_id] = {
+        err = {
+          code = protocol.ErrorCodes.InternalError,
+          message = 'textDocument/completion was not dispatched',
+        },
+      }
+      finish()
     end
   end
+
+  finish() -- sentinel: empty set, or every dispatch failed
 
   return function()
     for client_id, request_id in pairs(request_ids) do
@@ -936,85 +1149,488 @@ function CompletionResolver:request(bufnr, param, selected_word)
   end, math.floor(debounce_time))
 end
 
---- Defines a CompleteChanged handler to highlight the completion info popup and request/display LSP
---- completion item documentation via completionItem/resolve
---- @param group string
---- @param bufnr integer
-local function on_completechanged(group, bufnr)
-  nvim_on('CompleteChanged', group, {
-    buf = bufnr,
-    desc = 'Highlight completion info popup and request/display LSP completion item documentation via completionItem/resolve',
-  }, function(ev)
-    local completed_item = vim.v.event.completed_item or {}
-    local user_data = vim.tbl_get(completed_item, 'user_data', 'nvim', 'lsp')
-    if not user_data then
-      return
-    end
-    if (completed_item.info or '') ~= '' then
-      local data = vim.fn.complete_info({ 'selected' })
-      update_popup_window(data.preview_winid, data.preview_bufnr, user_data.info_kind)
-    end
-
-    if user_data.completion_item_needs_resolving then
-      Context.resolve_handler = Context.resolve_handler or CompletionResolver.new()
-      Context.resolve_handler:request(
-        ev.buf,
-        user_data.completion_item,
-        assert(completed_item.word)
-      )
-    end
-  end)
+--- @param t table<integer, any>
+--- @return integer[]
+local function sorted_keys(t)
+  local keys = vim.tbl_keys(t) --- @type integer[]
+  table.sort(keys)
+  return keys
 end
 
-local function on_complete_done()
-  local completed_item = api.nvim_get_vvar('completed_item')
-  local user_data = completed_item and vim.tbl_get(completed_item, 'user_data', 'nvim', 'lsp')
-  if not user_data then
-    Context:reset()
+--- Converts the cached answers into the list the engine gets.
+---
+--- @param session vim.lsp.completion.Session
+--- @param lnum integer 0-indexed row
+--- @param line string the line as the engine filters against it
+--- @param compl_col integer 0-indexed column the list is anchored at
+--- @param cursor_col integer 0-indexed column the prefix ends at
+--- @return table[]
+local function build_view(session, lnum, line, compl_col, cursor_col)
+  -- In the caller's order, which the sort below falls back to.
+  local rank = vim.tbl_get(buf_handles, session.bufnr, 'rank') or {}
+  local ids = sorted_keys(session.responses)
+  table.sort(ids, function(a, b)
+    local ra, rb = rank[a] or math.huge, rank[b] or math.huge
+    if ra ~= rb then
+      return ra < rb
+    end
+    return a < b
+  end)
+
+  local secondary = vim.tbl_get(buf_handles, session.bufnr, 'secondary') or {}
+  local converted = {} --- @type table<integer, table[]>
+  --- @type table<integer, table<table, { start: integer }>>
+  local order = {}
+  --- @type table<table, { start: integer, client_id: integer, sort_text: string, pos: integer }>
+  local by_item = {}
+  local seen = {} --- @type table<string, true>
+  for _, client_id in ipairs(ids) do
+    local cached = session.responses[client_id]
+    converted[client_id], order[client_id] = M._lsp_to_complete_items(
+      cached.result,
+      line,
+      compl_col,
+      cursor_col,
+      client_id,
+      lnum,
+      cached.encoding,
+      session.bufnr
+    )
+    if not secondary[client_id] then
+      for _, item in ipairs(converted[client_id]) do
+        seen[item.word] = true
+      end
+    end
+  end
+
+  local matches = {} --- @type table[]
+  for _, client_id in ipairs(ids) do
+    -- As VS Code's word-based suggestions: only when no server has any.
+    if not (secondary[client_id] and next(seen)) then
+      for _, item in ipairs(converted[client_id]) do
+        matches[#matches + 1] = item
+        -- compl_col, not 0, so an item without one does not sort ahead of everything.
+        local how = (order[client_id] or {})[item] or { start = compl_col }
+        local lsp_item = item.user_data.nvim.lsp.completion_item --- @type lsp.CompletionItem
+        by_item[item] = {
+          start = how.start,
+          client_id = client_id,
+          sort_text = nonempty(lsp_item.sortText) or lsp_item.label,
+          pos = #matches,
+        }
+      end
+    end
+  end
+
+  local user_cmp = vim.tbl_get(buf_handles, session.bufnr, 'cmp')
+  if user_cmp then
+    table.sort(matches, user_cmp)
+  elseif not has_completeopt('nosort') then
+    -- Ends on the collected order, which the engine keeps between equal fuzzy scores.
+    table.sort(matches, function(a, b)
+      local x, y = by_item[a], by_item[b]
+      -- Start column first: one reaching further back answers a different word.
+      if (x.start or 0) ~= (y.start or 0) then
+        return (x.start or 0) < (y.start or 0)
+      end
+      -- Then the caller's order: "sortText" only ranks a server's own items.
+      local rx = rank[x.client_id] or math.huge
+      local ry = rank[y.client_id] or math.huge
+      if rx ~= ry then
+        return rx < ry
+      end
+      -- Unranked clients by id, as before rank existed.
+      if x.client_id ~= y.client_id then
+        return x.client_id < y.client_id
+      end
+      if x.sort_text ~= y.sort_text then
+        return x.sort_text < y.sort_text
+      end
+      return x.pos < y.pos
+    end)
+  end
+
+  -- Builtin candidates first, as before the list was replaced, minus server words.
+  local view = {} --- @type table[]
+  for _, m in ipairs(session.other_items or {}) do
+    if not seen[m.word] then
+      view[#view + 1] = m
+    end
+  end
+  vim.list_extend(view, matches)
+  return view
+end
+
+--- Set while our nvim__complete() runs: the CompleteDone it fires keeps the cache.
+local calling = false
+
+--- Hands a new list to the completion engine.
+---
+--- @param session vim.lsp.completion.Session
+--- @param ctx vim.lsp.completion.LineContext
+local function do_publish(session, ctx)
+  -- Nothing matched a shorter leader, so nothing matches this one: no conversion
+  -- on every keystroke of a word without candidates.
+  local leader = ctx.line:sub(ctx.word_col + 1, ctx.cursor_col)
+  if
+    session.empty_for
+    and #leader > #session.empty_for
+    and vim.startswith(leader, session.empty_for)
+  then
     return
   end
+
+  session:capture_other_items()
+
+  if session.id then
+    -- A running session pins the column, and its leader replaces the shown match,
+    -- which sits in the line and would move the `\k*$` boundary.
+    local col = assert(session.col)
+    local line, cursor_col = ctx.line, ctx.cursor_col
+    if session.leader then
+      line = ctx.line:sub(1, col - 1) .. session.leader .. ctx.line:sub(cursor_col + 1)
+      cursor_col = col - 1 + #session.leader
+    end
+    local view = build_view(session, ctx.row - 1, line, col - 1, cursor_col)
+    -- An empty list ends the session (it would take <C-n>); the cache stays for <BS>.
+    calling = true
+    local id = #view > 0 and api.nvim__complete({ id = session.id, items = view })
+      or api.nvim__complete({ id = session.id })
+    calling = false
+    if #view > 0 and id > 0 then
+      session.empty_for = nil
+      return
+    end
+    session.id, session.col, session.leader = nil, nil, nil
+    if #view == 0 or id == 0 then
+      session.empty_for = line:sub(col, cursor_col)
+      return
+    end
+    -- Ended during the request, or another window's: start a new one below.
+  end
+
+  local col = ctx.word_col + 1
+  local view = build_view(session, ctx.row - 1, ctx.line, ctx.word_col, ctx.cursor_col)
+  if #view == 0 then
+    session.empty_for = leader
+    return -- not started on an empty list, for the same reason
+  end
+  session.empty_for = nil
+  calling = true
+  local id = api.nvim__complete({ col = col, items = view })
+  calling = false
+  if id == 0 then
+    session.empty_for = leader -- nothing matched what is typed
+  elseif id > 0 then
+    session.id, session.col = id, col
+    -- Seeded: the first CompleteChanged fires before the id is known.
+    session.leader = ctx.line:sub(ctx.word_col + 1, ctx.cursor_col)
+  end
+end
+
+--- @param session vim.lsp.completion.Session
+--- @param ctx vim.lsp.completion.LineContext
+local function publish(session, ctx)
+  -- Reported, not raised: in a scheduled callback each keystroke would raise it again.
+  local ok, err = pcall(do_publish, session, ctx)
+  if not ok then
+    vim.notify_once(('vim.lsp.completion: %s'):format(err), vim.log.levels.ERROR)
+    session:reset(true)
+  end
+end
+
+--- Defined below: their bodies need publish() and request_incomplete().
+local register_session_autocmds --- @type fun(bufnr: integer): integer
+local on_selection_changed --- @type fun(bufnr: integer)
+
+--- Re-request from the clients that reported `isIncomplete`.
+---
+--- @param sess vim.lsp.completion.Session
+local function request_incomplete(sess)
+  reset_timer()
+
+  local bufnr = sess.bufnr
+  local ident = vim.tbl_get(buf_handles, bufnr, 'identifier') or {}
+  -- Incomplete ones, and identifier clients a trigger character did not reach.
+  local function asked()
+    local ids = {} --- @type integer[]
+    local clients = vim.tbl_get(buf_handles, bufnr, 'clients') or {} --- @type table<integer, vim.lsp.Client>
+    for _, client in pairs(clients) do
+      if sess.incomplete[client.id] or (sess.responses[client.id] == nil and ident[client.id]) then
+        ids[#ids + 1] = client.id
+      end
+    end
+    return ids
+  end
+  local debounce_ms = adaptive_debounce(sess.last_request_time, rtt_for_ids(asked()).rtt_ms)
+  local function run()
+    if api.nvim_get_current_buf() == bufnr and Session.peek(bufnr) == sess then
+      M.get({
+        ctx = { triggerKind = protocol.CompletionTriggerKind.TriggerForIncompleteCompletions },
+        client_id = asked(),
+      })
+    end
+  end
+  if debounce_ms == 0 then
+    vim.schedule(run)
+  else
+    completion_timer = new_timer()
+    completion_timer:start(
+      math.floor(debounce_ms),
+      0,
+      vim.schedule_wrap(function()
+        reset_timer()
+        run()
+      end)
+    )
+  end
+end
+
+--- @param bufnr integer
+--- @param clients table<integer, vim.lsp.Client> # keys != client_id
+--- @param ctx lsp.CompletionContext
+--- @param explicit? boolean The user asked: it replaces a shown list and starts
+--- from nothing.  Not in "ctx", whose "Invoked" also covers typing an identifier.
+local function trigger(bufnr, clients, ctx, explicit)
+  reset_timer()
+
+  local session = Session.get(bufnr)
+  session:cancel_request()
+
+  -- A trigger character or an explicit request replaces the shown list in place.
+  local wanted = explicit == true
+    or (ctx and ctx.triggerKind) == protocol.CompletionTriggerKind.TriggerCharacter
+  if vim.fn.pumvisible() ~= 0 and not wanted and not session:has_incomplete() then
+    return
+  end
+
+  -- Kept for the same word unless asked explicitly: only the clients asked answer
+  -- again, and absolute ranges make another word start invalidate it all.
+  local anchor = session_anchor(session, line_context())
+  local retrigger = not explicit and session.anchor == anchor
+  if not retrigger then
+    session.responses = {}
+    session.incomplete = {}
+  end
+  -- A round is about to change the cache, kept or not.
+  session.empty_for = nil
+  session.anchor = anchor
+
+  session.generation = session.generation + 1
+  local generation = session.generation
+
+  if ctx and ctx.triggerKind == protocol.CompletionTriggerKind.Invoked then
+    register_session_autocmds(bufnr)
+  end
+
+  local win = api.nvim_get_current_win()
+  local cursor_row = api.nvim_win_get_cursor(win)[1]
+  local start_time = vim.uv.hrtime() --[[@as integer]]
+  session.last_request_time = start_time
+
+  local settled = false
+  local cancel = request(clients, bufnr, win, ctx, session.incomplete, function(responses)
+    settled = true
+    -- Cancelling is best effort; a stale callback must not overwrite this one.
+    ---@diagnostic disable-next-line: preferred-local-alias
+    if generation ~= session.generation then
+      return
+    end
+
+    session.cancel = nil
+
+    local back = line_context()
+    if back.row ~= cursor_row or session_anchor(session, back) ~= session.anchor then
+      return -- the word this round asked about is no longer the one at the cursor
+    end
+
+    local end_time = vim.uv.hrtime()
+    local r = rtt_for(clients)
+    r.rtt_ms = r.average((end_time - start_time) * ns_to_ms)
+
+    -- Arbitrarily long after the request: the window may be gone.
+    if not api.nvim_win_is_valid(win) or not in_insert_mode() then
+      return
+    end
+    if api.nvim_win_get_cursor(win)[1] ~= cursor_row then
+      return
+    end
+
+    for client_id, response in pairs(responses) do
+      local client = lsp.get_client_by_id(client_id)
+      local name = client and client.name or 'UNKNOWN'
+      local err = response.err
+      local result = response.result
+      local code = err and err.code
+
+      -- "Ignore this answer, keep what you had." Routine while typing.
+      local discard = code == protocol.ErrorCodes.ContentModified
+        or code == protocol.ErrorCodes.RequestCancelled
+      -- Not error(): throwing here drops every client after this one.
+      local malformed = type(result) == 'table' and result.items == vim.NIL
+
+      if not discard then
+        if malformed then
+          vim.notify_once(
+            ('%s: completion response has items=null, expected CompletionItem[]'):format(name),
+            vim.log.levels.WARN
+          )
+        elseif err then
+          vim.notify_once(
+            ('%s: %s %s'):format(name, code or 'NO_CODE', err.message),
+            vim.log.levels.WARN
+          )
+        end
+
+        if err or malformed or vim.isnil(result) then
+          -- Clear both, else the incomplete flag re-requests forever.
+          session.responses[client_id] = nil
+          session.incomplete[client_id] = nil
+        else
+          -- An empty incomplete list means request again when needed.
+          session.responses[client_id] = {
+            result = result,
+            encoding = client and client.offset_encoding or 'utf-16',
+            position = response.position,
+          }
+          session.incomplete[client_id] = result.isIncomplete or nil
+        end
+      end
+    end
+
+    -- nvim__complete changes text, which the <C-x><C-o> textlock forbids.
+    vim.schedule(function()
+      ---@diagnostic disable-next-line: preferred-local-alias
+      if generation ~= session.generation or Session.peek(bufnr) ~= session then
+        return -- superseded while waiting for the next tick
+      end
+      -- Checked a tick ago; the start path raises outside Insert mode.
+      if not in_insert_mode() or api.nvim_get_current_buf() ~= bufnr then
+        return
+      end
+      local ctx2 = line_context()
+      if ctx2.row ~= cursor_row or session_anchor(session, ctx2) ~= session.anchor then
+        return -- a key in between moved off the word this round was about
+      end
+      publish(session, ctx2)
+    end)
+  end)
+
+  -- A synchronous answer settles the round before request() returns.
+  if not settled then
+    session.cancel = cancel
+  end
+end
+
+--- @nodoc
+--- A shrinking leader re-asks only incomplete clients: the engine holds the rest.
+---
+--- @param leader string?
+function Session:on_leader(leader)
+  if not self.id then
+    -- Not ours: a native <C-n> or another plugin's complete() also gets here.
+    return
+  end
+  local prev = self.leader
+  self.leader = leader
+  if not (prev and leader and #leader < #prev) then
+    return
+  end
+
+  if self:has_incomplete() then
+    request_incomplete(self)
+  end
+end
+
+--- @param bufnr integer
+local function on_complete_done(bufnr)
+  local completed_item = api.nvim_get_vvar('completed_item') --- @type vim.v.completed_item
+  local lsp_data = vim.tbl_get(completed_item or {}, 'user_data', 'nvim', 'lsp')
+  local completion_item = lsp_data and lsp_data.completion_item --- @type lsp.CompletionItem?
+  local client_id = lsp_data and lsp_data.client_id --- @type integer?
 
   local cursor_row, cursor_col = unpack(api.nvim_win_get_cursor(0)) --- @type integer, integer
   cursor_row = cursor_row - 1
-  local completion_item = user_data.completion_item --- @type lsp.CompletionItem
-  local client_id = user_data.client_id --- @type integer
-  if not completion_item or not client_id then
-    Context:reset()
-    return
+
+  local session = Session.peek(bufnr)
+  -- CompleteDone carries no column, and the accepted match moved `\k*$`.
+  local session_col = session and session.col
+  local position = session and client_id and vim.tbl_get(session.responses, client_id, 'position')
+  if session then
+    session:reset()
   end
 
-  local bufnr = api.nvim_get_current_buf()
-  local expand_snippet = completion_item.insertTextFormat == protocol.InsertTextFormat.Snippet
-    and (completion_item.textEdit ~= nil or nonempty(completion_item.insertText) ~= nil)
-
-  Context:reset()
+  if not completion_item or not client_id then
+    return
+  end
 
   local client = lsp.get_client_by_id(client_id)
   if not client then
     return
   end
 
+  local expand_snippet = completion_item.insertTextFormat == protocol.InsertTextFormat.Snippet
+    and (completion_item.textEdit ~= nil or nonempty(completion_item.insertText) ~= nil)
   local position_encoding = client.offset_encoding or 'utf-16'
   local resolve_provider = completion_options(client, bufnr).resolveProvider
 
-  -- Keep reference to avoid race where completion/resolve response arrives after on_insert_leave
-  -- and Context.cursor got cleared before clear_word() gets called
-  local context_cursor = assert(Context.cursor)
+  --- Removes what the edit's range covers past the cursor, which the engine leaves:
+  --- a TextEdit's range, or under 'replace' an `lsp.InsertReplaceEdit`'s replace
+  --- range.  Counted in characters, as the engine rewrote the line before the cursor.
+  local function apply_replace_range()
+    local edit = completion_item.textEdit
+    if not edit then
+      return
+    end
+    local range = (edit --[[@as lsp.TextEdit]]).range --- @type lsp.Range?
+    local insert_replace = edit --[[@as lsp.InsertReplaceEdit]]
+    local replace, insert = insert_replace.replace, insert_replace.insert
+    local extra --- @type integer?
+    if range then
+      -- From where it was asked: what was typed since went in before the cursor.
+      if position and range['end'].line == position.line then
+        extra = (range['end'].character - position.character) --[[@as integer]]
+      end
+    elseif
+      vim.tbl_get(buf_handles, bufnr, 'insert_mode') == 'replace'
+      and replace
+      and insert
+      and replace['end'].line == insert['end'].line
+    then
+      extra = replace['end'].character - insert['end'].character
+    end
+    if not extra or extra <= 0 then
+      return
+    end
+    local line = assert(api.nvim_buf_get_lines(bufnr, cursor_row, cursor_row + 1, true)[1])
+    local from = vim.str_utfindex(line, position_encoding, cursor_col, false)
+    local end_col = vim.str_byteindex(line, position_encoding, from + extra, false)
+    if end_col > cursor_col then
+      api.nvim_buf_set_text(bufnr, cursor_row, cursor_col, cursor_row, end_col, { '' })
+    end
+  end
+
+  local rewrite_col = lsp_data.rewrite_col --- @type integer?
 
   local function clear_word()
-    if not expand_snippet then
-      return nil
+    if not expand_snippet and not rewrite_col then
+      return
+    end
+    -- An item that replaces text in front of the word carries its own column.
+    local col = completed_item.startcol or session_col --- @type integer?
+    local start_col = rewrite_col or (col and col - 1) --- @type integer?
+    if not start_col then
+      return
     end
 
-    -- Remove the already inserted word.
-    api.nvim_buf_set_text(
-      bufnr,
-      context_cursor[1] - 1,
-      context_cursor[2] - 1,
-      cursor_row,
-      cursor_col,
-      { '' }
-    )
+    -- Remove the already inserted word, or put the edit in its place.
+    local edit = not expand_snippet and completion_item.textEdit
+    local lines = vim.split(edit and edit.newText or '', '\n', { plain = true })
+    api.nvim_buf_set_text(bufnr, cursor_row, start_col, cursor_row, cursor_col, lines)
+    if edit then
+      local last = #lines[#lines] + (#lines == 1 and start_col or 0) --- @type integer
+      api.nvim_win_set_cursor(0, { cursor_row + #lines, last })
+    end
   end
 
   local function exec_command()
@@ -1030,6 +1646,8 @@ local function on_complete_done()
     lsp.util.apply_text_edits(edits, bufnr, position_encoding, nil, { keep_cursor = true })
   end
 
+  -- Before the edits below, which move the cursor this span is measured from.
+  apply_replace_range()
   clear_word()
 
   local edits = completion_item.additionalTextEdits
@@ -1067,194 +1685,218 @@ local function on_complete_done()
   end, bufnr)
 end
 
----@param bufnr integer
----@return integer
-local function register_completedone(bufnr)
+--- @nodoc
+--- The session's autocommands; trigger() calls it too, for 'omnifunc' without enable().
+---
+--- @return integer group
+function register_session_autocmds(bufnr)
   local group = api.nvim_create_augroup(get_augroup(bufnr), { clear = false })
   if #api.nvim_get_autocmds({ buf = bufnr, event = 'CompleteDone', group = group }) > 0 then
     return group
   end
 
-  nvim_on('CompleteDone', group, { buf = bufnr }, function()
+  nvim_on('CompleteDone', group, { buf = bufnr }, function(ev)
     local reason = api.nvim_get_vvar('event').reason ---@type string
     if reason == 'accept' then
-      on_complete_done()
-    elseif reason == 'cancel' then
-      -- <C-e> dismissed the pum; stop re-querying an incomplete list.
-      Context:reset()
+      on_complete_done(ev.buf)
+    elseif not calling then
+      -- Not the completion ours is taking over; the cache holds then.
+      local session = Session.peek(ev.buf)
+      if session then
+        session:reset()
+      end
+    end
+  end)
+
+  -- A <BS> fires no InsertCharPre.  The popup belongs to enable().
+  nvim_on('CompleteChanged', group, {
+    buf = bufnr,
+    desc = 'vim.lsp.completion: refresh the candidates and the info popup',
+  }, function(ev)
+    local session = Session.peek(ev.buf)
+    if session then
+      session:on_leader(vim.v.event.complete_leader)
+    end
+    if buf_handles[ev.buf] then
+      on_selection_changed(ev.buf)
+    end
+  end)
+
+  nvim_on('InsertLeave', group, { buf = bufnr }, function(ev)
+    reset_timer()
+    local session = Session.peek(ev.buf)
+    if session then
+      session:reset()
+    end
+  end)
+
+  -- Leaving the buffer in Insert mode (<Cmd>, nvim_set_current_buf()) ends the
+  -- engine session without the CompleteDone above; reset only, it is cancelled.
+  nvim_on('BufLeave', group, { buf = bufnr }, function(ev)
+    local session = Session.peek(ev.buf)
+    if session then
+      session:reset()
     end
   end)
 
   return group
 end
 
+--- @nodoc
+--- Highlights the info popup and resolves documentation.  A feature of enable().
+---
 --- @param bufnr integer
---- @param clients table<integer, vim.lsp.Client>
---- @param ctx lsp.CompletionContext
-local function trigger(bufnr, clients, ctx)
-  reset_timer()
-  Context:cancel_pending()
-
-  if vim.fn.pumvisible() ~= 0 and not Context.isIncomplete then
+function on_selection_changed(bufnr)
+  if not has_completeopt('popup') then
     return
   end
-
-  if ctx and ctx.triggerKind == protocol.CompletionTriggerKind.Invoked then
-    register_completedone(bufnr)
+  local completed_item = vim.v.event.completed_item or {}
+  local user_data = vim.tbl_get(completed_item, 'user_data', 'nvim', 'lsp')
+  if not user_data then
+    return
+  end
+  if (completed_item.info or '') ~= '' then
+    local data = vim.fn.complete_info({ 'selected' })
+    update_popup_window(data.preview_winid, data.preview_bufnr, user_data.info_kind)
   end
 
-  local win = api.nvim_get_current_win()
-  local cursor_row = api.nvim_win_get_cursor(win)[1]
-  local start_time = vim.uv.hrtime() --[[@as integer]]
-  Context.last_request_time = start_time
+  local session = Session.peek(bufnr)
+  if session and user_data.completion_item_needs_resolving then
+    session.resolver = session.resolver or CompletionResolver.new()
+    session.resolver:request(bufnr, user_data.completion_item, assert(completed_item.word))
+  end
+end
 
-  local cancel_request = request(clients, bufnr, win, ctx, function(responses)
-    local end_time = vim.uv.hrtime()
-    rtt_ms = compute_new_average((end_time - start_time) * ns_to_ms)
-
-    Context.pending_requests = {}
-    Context.isIncomplete = false
-
-    local new_cursor_row, cursor_col = unpack(api.nvim_win_get_cursor(win)) --- @type integer, integer
-    local row_changed = new_cursor_row ~= cursor_row
-    local mode = api.nvim_get_mode().mode
-    if row_changed or not (mode == 'i' or mode == 'ic') then
-      return
-    end
-
-    local line = api.nvim_get_current_line()
-    local line_to_cursor = line:sub(1, cursor_col)
-    local word_boundary = vim.fn.match(line_to_cursor, '\\k*$')
-
-    local matches = {}
-
-    local server_start_boundary --- @type integer?
-    for client_id, response in pairs(responses) do
-      local client = lsp.get_client_by_id(client_id)
-      if response.err then
-        local msg = ('%s: %s %s'):format(
-          client and client.name or 'UNKNOWN',
-          response.err.code or 'NO_CODE',
-          response.err.message
-        )
-        vim.notify_once(msg, vim.log.levels.WARN)
-      end
-
-      local result = response.result
-      if type(result) == 'table' and result.items == vim.NIL then
-        error(
-          ('%s: completion response has items=null, expected CompletionItem[]'):format(
-            client and client.name or 'UNKNOWN'
-          )
-        )
-      -- result is CompletionItem[] or CompletionList; result.items may be empty, and
-      -- an empty incomplete list means request again when needed.
-      elseif not vim.isnil(result) then
-        Context.isIncomplete = Context.isIncomplete or result.isIncomplete
-        if #(result.items or result) > 0 then
-          local encoding = client and client.offset_encoding or 'utf-16'
-          local client_matches, tmp_server_start_boundary
-          client_matches, tmp_server_start_boundary = M._convert_results(
-            line,
-            cursor_row - 1,
-            cursor_col,
-            client_id,
-            word_boundary,
-            nil,
-            result,
-            encoding
-          )
-
-          server_start_boundary = tmp_server_start_boundary or server_start_boundary
-          vim.list_extend(matches, client_matches)
-        end
-      end
-    end
-
-    --- @type table[]
-    local prev_matches = vim.fn.complete_info({ 'items', 'matches' })['items']
-
-    --- @param prev_match table
-    prev_matches = vim.tbl_filter(function(prev_match)
-      local client_id = vim.tbl_get(prev_match, 'user_data', 'nvim', 'lsp', 'client_id')
-      if client_id and responses[client_id] ~= nil then
-        return false
-      end
-      return vim.tbl_get(prev_match, 'match')
-    end, prev_matches)
-
-    matches = vim.list_extend(prev_matches, matches)
-    local user_cmp = vim.tbl_get(buf_handles, bufnr, 'cmp')
-    if user_cmp then
-      table.sort(matches, user_cmp)
-    end
-
-    local start_col = (server_start_boundary or word_boundary) + 1
-    Context.cursor = { cursor_row, start_col }
-    if #matches > 0 and has_completeopt('popup') then
-      local group = get_augroup(bufnr)
-      if #api.nvim_get_autocmds({ buf = bufnr, event = 'CompleteChanged', group = group }) == 0 then
-        on_completechanged(group, bufnr)
-      end
-    end
-    vim.fn.complete(start_col, matches)
-  end)
-
-  table.insert(Context.pending_requests, cancel_request)
+--- <BS> out of a word nothing matched: no session is left for CompleteChanged to
+--- report it, so the list is asked for, or published from the cache, again.
+--- @param bufnr integer
+local function on_text_changed(bufnr)
+  local session = Session.peek(bufnr)
+  if not (session and session.empty_for and not session.id) then
+    return
+  end
+  local ctx = line_context()
+  if session_anchor(session, ctx) ~= session.anchor then
+    return
+  end
+  -- Typed rather than deleted: InsertCharPre has seen it.
+  if #ctx.line:sub(ctx.word_col + 1, ctx.cursor_col) >= #session.empty_for then
+    return
+  end
+  if session:has_incomplete() then
+    request_incomplete(session)
+  else
+    publish(session, ctx)
+  end
 end
 
 --- @param handle vim.lsp.completion.BufHandle
-local function on_insert_char_pre(handle)
-  if Context.isIncomplete then
-    reset_timer()
-
-    local debounce_ms = adaptive_debounce(Context.last_request_time, rtt_ms)
-    local ctx = { triggerKind = protocol.CompletionTriggerKind.TriggerForIncompleteCompletions }
-    if debounce_ms == 0 then
-      vim.schedule(function()
-        M.get({ ctx = ctx })
-      end)
-    else
-      completion_timer = new_timer()
-      completion_timer:start(
-        math.floor(debounce_ms),
-        0,
-        vim.schedule_wrap(function()
-          M.get({ ctx = ctx })
-        end)
-      )
-    end
-
-    return
-  end
-
-  if vim.fn.pumvisible() ~= 0 then
-    return
-  end
-
+--- @param bufnr integer
+local function on_insert_char_pre(handle, bufnr)
+  local session = Session.peek(bufnr)
   local char = vim.v.char
+
+  -- Before the guards: a trigger character opens a context filtering cannot reach.
   local matched_clients = handle.triggers[char]
+  local ctx = matched_clients
+    and {
+      triggerKind = protocol.CompletionTriggerKind.TriggerCharacter,
+      triggerCharacter = char,
+    }
+
+  -- A character goes only to the clients that asked for it.
+  if not matched_clients then
+    -- Same anchor only: past it trigger() drops the cache, which this subset cannot refill.
+    if
+      session
+      and session:has_incomplete()
+      and session.anchor == session_anchor(session, line_context())
+    then
+      request_incomplete(session)
+      return
+    end
+    if vim.fn.pumvisible() ~= 0 then
+      return -- the engine filters what it has
+    end
+  end
+
+  -- Per the LSP spec, identifiers are the client's: servers list only other
+  -- characters.  Only at the end of a word, and not for a number.
+  if not ctx and next(handle.identifier or {}) then
+    local col = api.nvim_win_get_cursor(0)[2]
+    local line = api.nvim_get_current_line()
+    -- The leader, not the match: ins_compl_addleader() has not taken it back yet.
+    if session and session.id and session.col and session.leader then
+      line = line:sub(1, session.col - 1) .. session.leader .. line:sub(col + 1)
+      col = session.col - 1 + #session.leader
+    end
+    local word = vim.fn.matchstr(line:sub(1, col) .. char, [[\k*$]])
+    if word ~= '' and tonumber(word) == nil and vim.fn.match(line:sub(col + 1), [[^\k]]) ~= 0 then
+      -- Every identifier client answered this word completely, so typing narrows the cache.
+      local all_answered = session ~= nil
+        and session.anchor == session_anchor(session, line_context())
+      if all_answered and session then
+        for id, c in pairs(handle.identifier) do
+          -- A server without completion never answers.
+          if not session.responses[id] and c:supports_method('textDocument/completion', bufnr) then
+            all_answered = false
+            break
+          end
+        end
+      end
+      if all_answered and session and not session:has_incomplete() then
+        -- A trigger character that is also a keyword character may have left one pending.
+        reset_timer()
+        local generation = session.generation
+        local anchor = session.anchor
+        vim.schedule(function()
+          if
+            ---@diagnostic disable-next-line: preferred-local-alias
+            generation ~= session.generation
+            or Session.peek(bufnr) ~= session
+            or api.nvim_get_current_buf() ~= bufnr
+            or not in_insert_mode()
+          then
+            return
+          end
+          -- v:char has landed: publish only if the cache still answers this word.
+          local ctx2 = line_context()
+          if session_anchor(session, ctx2) == anchor then
+            publish(session, ctx2)
+          end
+        end)
+        return
+      end
+      matched_clients = vim.tbl_values(handle.identifier)
+      ctx = { triggerKind = protocol.CompletionTriggerKind.Invoked }
+    end
+  end
+
   -- Discard pending trigger char, complete the "latest" one.
   -- Can happen if a mapping inputs multiple trigger chars simultaneously.
   reset_timer()
   if matched_clients then
-    completion_timer = assert(vim.uv.new_timer())
+    completion_timer = new_timer()
     completion_timer:start(25, 0, function()
       reset_timer()
       vim.schedule(function()
-        trigger(api.nvim_get_current_buf(), matched_clients, {
-          triggerKind = protocol.CompletionTriggerKind.TriggerCharacter,
-          triggerCharacter = char,
-        })
+        trigger(api.nvim_get_current_buf(), matched_clients, ctx)
       end)
     end)
   end
 end
 
-local function on_insert_leave()
-  reset_timer()
-  Context.cursor = nil
-  Context:reset()
+--- @param handle vim.lsp.completion.BufHandle
+--- @param client_id integer
+local function remove_trigger_client(handle, client_id)
+  for char, clients in pairs(handle.triggers) do
+    --- @param c vim.lsp.Client
+    local rest = vim.tbl_filter(function(c)
+      return c.id ~= client_id
+    end, clients)
+    -- nil, not {}: on_insert_char_pre() takes any table as a client wanting it.
+    handle.triggers[char] = next(rest) and rest or nil
+  end
 end
 
 --- @param client_id integer
@@ -1265,26 +1907,43 @@ local function disable_completions(client_id, bufnr)
     return
   end
 
+  local session = Session.peek(bufnr)
+  if session then
+    session.responses[client_id] = nil
+    session.incomplete[client_id] = nil
+  end
+
   handle.clients[client_id] = nil
+  handle.identifier[client_id] = nil
+  if handle.rank then
+    handle.rank[client_id] = nil
+  end
+  if handle.secondary then
+    handle.secondary[client_id] = nil
+  end
+  if handle.autotrigger then
+    handle.autotrigger[client_id] = nil
+  end
   if not next(handle.clients) then
     buf_handles[bufnr] = nil
+    -- Ended: with the handlers gone, a running session would take keys unanswered.
+    Session.discard(bufnr, true)
     api.nvim_del_augroup_by_name(get_augroup(bufnr))
   else
-    for char, clients in pairs(handle.triggers) do
-      --- @param c vim.lsp.Client
-      handle.triggers[char] = vim.tbl_filter(function(c)
-        return c.id ~= client_id
-      end, clients)
-    end
+    remove_trigger_client(handle, client_id)
   end
 end
 
 --- @inlinedoc
 --- @class vim.lsp.completion.BufferOpts
 --- @field autotrigger? boolean  (default: false) When true, completion triggers automatically based on the server's `triggerCharacters`.
+--- @field identifier? boolean  (default: false) When true, completion also triggers while an identifier is being typed.
 --- @field convert? fun(item: lsp.CompletionItem): table Transforms an LSP CompletionItem to |complete-items|.
 --- @field cmp? fun(a: table, b: table): boolean Comparator for sorting merged completion items from all servers.
 --- @field commit_characters? boolean  (default: true) When false, commit characters are ignored.
+--- @field package _rank? integer Where this client's items go when the match scores do not separate them, lower first; clients without one come last.
+--- @field package _secondary? boolean When true, this client's items are left out while another client offers any.
+--- @field insert_mode? 'insert'|'replace' (default: "insert") How much of an `lsp.InsertReplaceEdit` is replaced: up to the cursor, or its whole replace range.
 
 ---@param client_id integer
 ---@param bufnr integer
@@ -1292,22 +1951,17 @@ end
 local function enable_completions(client_id, bufnr, opts)
   local buf_handle = buf_handles[bufnr]
   if not buf_handle then
-    buf_handle = {
-      clients = {},
-      triggers = {},
-      convert = opts.convert,
-      cmp = opts.cmp,
-      commit_characters = opts.commit_characters ~= false,
-    }
+    buf_handle = { clients = {}, triggers = {}, identifier = {} }
     buf_handles[bufnr] = buf_handle
 
     -- Set up autocommands.
-    local group = register_completedone(bufnr)
+    local group = register_session_autocmds(bufnr)
     nvim_on('BufUnload', group, {
       buf = bufnr,
       desc = 'vim.lsp.completion: clean up on unload',
     }, function(ev)
       buf_handles[ev.buf] = nil
+      Session.discard(ev.buf)
       api.nvim_del_augroup_by_id(group)
     end)
     nvim_on('LspDetach', group, {
@@ -1316,36 +1970,60 @@ local function enable_completions(client_id, bufnr, opts)
     }, function(ev)
       disable_completions(ev.data.client_id, ev.buf)
     end)
+  end
 
-    if opts.autotrigger then
-      nvim_on('InsertCharPre', group, { buf = bufnr }, function()
-        on_insert_char_pre(buf_handles[bufnr])
-      end)
-      nvim_on('InsertLeave', group, { buf = bufnr }, on_insert_leave)
+  -- Per buffer, latest call wins; omitted fields keep their value.
+  for _, k in ipairs({ 'convert', 'cmp', 'commit_characters', 'insert_mode' }) do
+    if opts[k] ~= nil then
+      buf_handle[k] = opts[k]
     end
   end
 
-  if not buf_handle.clients[client_id] then
-    local client = assert(lsp.get_client_by_id(client_id), 'invalid client ID')
-
-    -- Add the new client to the buffer's clients.
-    buf_handle.clients[client_id] = client
-
-    -- Add the new client to the clients that should be triggered by its trigger characters.
-    --- @type string[]
-    local triggers = completion_options(client, bufnr).triggerCharacters or {}
-    for _, char in ipairs(triggers) do
-      local clients_for_trigger = buf_handle.triggers[char]
-      if not clients_for_trigger then
-        clients_for_trigger = {}
-        buf_handle.triggers[char] = clients_for_trigger
+  -- Not only on the first client: one that wants neither can come first.
+  if (opts.autotrigger or opts.identifier) and not buf_handle.listening then
+    buf_handle.listening = true
+    local group = api.nvim_create_augroup(get_augroup(bufnr), { clear = false })
+    nvim_on('InsertCharPre', group, { buf = bufnr }, function(ev)
+      local handle = buf_handles[ev.buf]
+      if handle then
+        on_insert_char_pre(handle, ev.buf)
       end
-      local client_exists = vim.iter(clients_for_trigger):any(function(c)
-        return c.id == client_id
-      end)
-      if not client_exists then
-        table.insert(clients_for_trigger, client)
+    end)
+    nvim_on('TextChangedI', group, { buf = bufnr }, function(ev)
+      if buf_handles[ev.buf] then
+        on_text_changed(ev.buf)
       end
+    end)
+  end
+
+  -- On every enable: options and registered characters can change.
+  local client = lsp.get_client_by_id(client_id)
+  if not client then
+    return -- stopped between the LspAttach and this call
+  end
+  buf_handle.clients[client_id] = client
+  -- Omitted keeps its value, as above.
+  if opts.identifier ~= nil then
+    buf_handle.identifier[client_id] = opts.identifier and client or nil
+  end
+  buf_handle.rank = buf_handle.rank or {}
+  buf_handle.secondary = buf_handle.secondary or {}
+  buf_handle.autotrigger = buf_handle.autotrigger or {}
+  if opts._rank ~= nil then
+    buf_handle.rank[client_id] = opts._rank
+  end
+  if opts._secondary ~= nil then
+    buf_handle.secondary[client_id] = opts._secondary or nil
+  end
+  if opts.autotrigger ~= nil then
+    buf_handle.autotrigger[client_id] = opts.autotrigger or nil
+  end
+  -- Again when kept: the server may declare other characters now.
+  remove_trigger_client(buf_handle, client_id)
+  if buf_handle.autotrigger[client_id] then
+    for _, char in ipairs(completion_options(client, bufnr).triggerCharacters or {}) do
+      buf_handle.triggers[char] = buf_handle.triggers[char] or {}
+      table.insert(buf_handle.triggers[char], client)
     end
   end
 end
@@ -1368,6 +2046,12 @@ end
 ---
 --- @note Behavior of `autotrigger=true` is controlled by the LSP `triggerCharacters` field. You
 --- can override it on LspAttach, see |lsp-autocompletion|.
+---
+--- @note `autotrigger` and `identifier` are per client, the other fields per
+--- buffer.  An omitted field keeps its previous value.
+---
+--- @note A trigger character, or |vim.lsp.completion.get()|, requests a new list
+--- even while the menu is shown.
 ---
 --- @param enable boolean True to enable, false to disable
 --- @param client_id integer Client ID
@@ -1416,7 +2100,10 @@ function M.get(opts)
     end, clients)
   end
 
-  trigger(bufnr, clients, ctx)
+  -- Explicit unless the client is following up: anything else is the user asking.
+  local following_up = ctx.triggerKind
+    == protocol.CompletionTriggerKind.TriggerForIncompleteCompletions
+  trigger(bufnr, clients, ctx, not following_up)
 end
 
 --- Implements 'omnifunc' compatible LSP completion.
@@ -1435,12 +2122,11 @@ function M._omnifunc(findstart, base)
   lsp.log.debug('omnifunc.findstart', { findstart = findstart, base = base })
   local bufnr = api.nvim_get_current_buf()
   local clients = lsp.get_clients({ bufnr = bufnr, method = 'textDocument/completion' })
-  local remaining = #clients
-  if remaining == 0 then
+  if #clients == 0 then
     return findstart == 1 and -1 or {}
   end
 
-  trigger(bufnr, clients, { triggerKind = protocol.CompletionTriggerKind.Invoked })
+  trigger(bufnr, clients, { triggerKind = protocol.CompletionTriggerKind.Invoked }, true)
 
   -- Return -2 to signal that we should continue completion so that we can
   -- async complete.

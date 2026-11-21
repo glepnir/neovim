@@ -2288,6 +2288,10 @@ enable({enable}, {client_id}, {bufnr}, {opts})   *vim.lsp.completion.enable()*
       • Behavior of `autotrigger=true` is controlled by the LSP
         `triggerCharacters` field. You can override it on LspAttach, see
         |lsp-autocompletion|.
+      • `autotrigger` and `identifier` are per client, the other fields per
+        buffer. An omitted field keeps its previous value.
+      • A trigger character, or |vim.lsp.completion.get()|, requests a new
+        list even while the menu is shown.
 
     Parameters: ~
       • {enable}     (`boolean`) True to enable, false to disable
@@ -2303,6 +2307,12 @@ enable({enable}, {client_id}, {bufnr}, {opts})   *vim.lsp.completion.enable()*
                        false, commit characters are ignored.
                      • {convert}? (`fun(item: lsp.CompletionItem): table`)
                        Transforms an LSP CompletionItem to |complete-items|.
+                     • {identifier}? (`boolean`) (default: false) When true,
+                       completion also triggers while an identifier is being
+                       typed.
+                     • {insert_mode}? (`'insert'|'replace'`) (default:
+                       "insert") How much of an `lsp.InsertReplaceEdit` is
+                       replaced: up to the cursor, or its whole replace range.
 
 get({opts})                                         *vim.lsp.completion.get()*
     Triggers LSP completion once in the current buffer, if LSP completion is
